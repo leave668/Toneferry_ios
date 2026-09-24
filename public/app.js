@@ -28,6 +28,11 @@ const noSleep = typeof NoSleepCtor === 'function' ? new NoSleepCtor() : null
 /** @type {ReturnType<typeof setTimeout> | null} */
 let reconnectTimer = null
 let reconnectAttempt = 0
+/** Dim UI and skip meter DOM updates after idle listening. */
+let powerSave = false
+/** @type {ReturnType<typeof setTimeout> | null} */
+let powerSaveTimer = null
+const POWER_SAVE_DELAY_MS = 30_000
 
 const scriptQueue = {
   samples: new Float32Array(0),
@@ -52,6 +57,52 @@ const scriptQueue = {
   frames() {
     return this.samples.length >> 1
   },
+}
+
+function setStatsEnabled(enabled) {
+  if (playerMode === 'worklet' && player) {
+    try {
+      player.port.postMessage({ type: 'stats-enable', enabled })
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function enterPowerSave() {
+  if (!listening || powerSave) return
+  powerSave = true
+  document.documentElement.classList.add('power-save')
+  setStatsEnabled(false)
+}
+
+function exitPowerSave() {
+  if (!powerSave) return
+  powerSave = false
+  document.documentElement.classList.remove('power-save')
+  setStatsEnabled(true)
+}
+
+function clearPowerSaveTimer() {
+  if (powerSaveTimer) {
+    clearTimeout(powerSaveTimer)
+    powerSaveTimer = null
+  }
+}
+
+function schedulePowerSave() {
+  clearPowerSaveTimer()
+  if (!listening) return
+  powerSaveTimer = setTimeout(() => {
+    powerSaveTimer = null
+    enterPowerSave()
+  }, POWER_SAVE_DELAY_MS)
+}
+
+function bumpIdle() {
+  if (!listening) return
+  exitPowerSave()
+  schedulePowerSave()
 }
 
 function setStatus(text, ok = false) {
@@ -274,12 +325,14 @@ async function ensurePlayer(sampleRate) {
       node.port.onmessage = (ev) => {
         const msg = ev.data
         if (msg?.type === 'stats') {
+          if (powerSave) return
           bufferedEl.textContent = String(msg.bufferedFrames)
           levelEl.style.width = `${Math.min(100, Math.round((msg.level || 0) * 140))}%`
         }
       }
       player = node
       playerMode = 'worklet'
+      if (powerSave) setStatsEnabled(false)
       if (audioContext.state === 'suspended') await audioContext.resume()
       return
     } catch (err) {
@@ -294,6 +347,13 @@ async function ensurePlayer(sampleRate) {
     const outL = ev.outputBuffer.getChannelData(0)
     const outR = ev.outputBuffer.getChannelData(1)
     const interleaved = scriptQueue.pull(bufferSize)
+    if (powerSave) {
+      for (let i = 0; i < bufferSize; i++) {
+        outL[i] = interleaved[i * 2] || 0
+        outR[i] = interleaved[i * 2 + 1] || 0
+      }
+      return
+    }
     let peak = 0
     for (let i = 0; i < bufferSize; i++) {
       const l = interleaved[i * 2] || 0
@@ -353,6 +413,7 @@ async function resumePlayback() {
   const wasPaused = backgroundPaused
   backgroundPaused = false
   clearReconnect()
+  bumpIdle()
 
   enableNoSleep()
   await startKeepAliveMedia()
@@ -461,6 +522,8 @@ async function start() {
   config = null
   reconnectAttempt = 0
   clearReconnect()
+  exitPowerSave()
+  schedulePowerSave()
   enableNoSleep()
 
   const unlock = new AudioContext()
@@ -475,6 +538,8 @@ async function stop() {
   listening = false
   backgroundPaused = false
   clearReconnect()
+  clearPowerSaveTimer()
+  exitPowerSave()
   reconnectAttempt = 0
   btnStart.disabled = false
   btnStop.disabled = true
@@ -512,6 +577,8 @@ btnStart.addEventListener('click', () => {
     console.error(err)
     setStatus(String(err.message || err))
     listening = false
+    clearPowerSaveTimer()
+    exitPowerSave()
     disableNoSleep()
     btnStart.disabled = false
     btnStop.disabled = true
@@ -520,6 +587,21 @@ btnStart.addEventListener('click', () => {
 btnStop.addEventListener('click', () => {
   stop().catch(console.error)
 })
+
+window.addEventListener(
+  'pointerdown',
+  () => {
+    if (listening) bumpIdle()
+  },
+  { passive: true },
+)
+window.addEventListener(
+  'keydown',
+  () => {
+    if (listening) bumpIdle()
+  },
+  { passive: true },
+)
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {

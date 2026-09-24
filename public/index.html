@@ -809,6 +809,86 @@
           opacity: 0.7;
         }
       }
+
+      .power-save-veil {
+        position: fixed;
+        inset: 0;
+        z-index: 40;
+        pointer-events: none;
+        background: #000;
+        opacity: 0;
+        transition: opacity 0.5s var(--ease);
+      }
+
+      .power-save-hint {
+        position: fixed;
+        left: 50%;
+        bottom: max(28px, env(safe-area-inset-bottom));
+        z-index: 41;
+        transform: translateX(-50%);
+        pointer-events: none;
+        margin: 0;
+        padding: 6px 12px;
+        border-radius: var(--radius-full);
+        background: rgba(0, 0, 0, 0.45);
+        color: rgba(248, 250, 252, 0.55);
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+        opacity: 0;
+        transition: opacity 0.5s var(--ease);
+      }
+
+      html.power-save .power-save-veil {
+        opacity: 0.78;
+      }
+
+      html.power-save .power-save-hint {
+        opacity: 1;
+      }
+
+      html.power-save body {
+        background: #000;
+      }
+
+      html.power-save .ambient {
+        display: none;
+      }
+
+      html.power-save .wave {
+        animation: none !important;
+        transform: scaleY(0.28);
+        opacity: 0.28;
+      }
+
+      html.power-save .visualizer,
+      html.power-save .player-card,
+      html.power-save .connection,
+      html.power-save .live-pill,
+      html.power-save .stat,
+      html.power-save .primary-button,
+      html.power-save .secondary-button {
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+        box-shadow: none !important;
+      }
+
+      html.power-save .player-card.is-live,
+      html.power-save .player-card.is-live .visualizer,
+      html.power-save .connection-dot.on,
+      html.power-save .live-pill .dot.on,
+      html.power-save .buffer-progress {
+        box-shadow: none !important;
+        transition: none !important;
+      }
+
+      html.power-save .hero-title {
+        text-shadow: none;
+      }
+
+      html.power-save .footer {
+        visibility: hidden;
+      }
     </style>
   </head>
 
@@ -923,6 +1003,9 @@
       </div>
     </main>
 
+    <div class="power-save-veil" aria-hidden="true"></div>
+    <p class="power-save-hint">轻触屏幕恢复亮度</p>
+
     <script src="./NoSleep.min.js"></script>
     <script type="module">
       import "./app.js";
@@ -948,7 +1031,10 @@
 
         const live = running || connected;
 
-        visualizer.classList.toggle("active", running);
+        visualizer.classList.toggle(
+          "active",
+          running && !document.documentElement.classList.contains("power-save"),
+        );
         playerCard.classList.toggle("is-live", live);
         statusDot.classList.toggle("on", live);
         statusBadgeDot.classList.toggle("on", live);
@@ -962,6 +1048,7 @@
       });
 
       const syncBuffer = new MutationObserver(() => {
+        if (document.documentElement.classList.contains("power-save")) return;
         bufferText.textContent = `${buffered.textContent.trim()} frames`;
       });
       syncBuffer.observe(buffered, {
@@ -974,6 +1061,12 @@
       buttonObserver.observe(btnStop, {
         attributes: true,
         attributeFilter: ["disabled"],
+      });
+
+      const powerSaveObserver = new MutationObserver(updateUI);
+      powerSaveObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["class"],
       });
 
       updateUI();

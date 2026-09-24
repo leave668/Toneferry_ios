@@ -40,7 +40,7 @@ class RingBuffer {
     }
   }
 
-  pull(outL, outR, frames) {
+  pull(outL, outR, frames, trackPeak) {
     let peak = 0
     for (let i = 0; i < frames; i++) {
       if (this.size > 0) {
@@ -48,8 +48,10 @@ class RingBuffer {
         const r = this.R[this.read]
         outL[i] = l
         outR[i] = r
-        const a = Math.abs(l) > Math.abs(r) ? Math.abs(l) : Math.abs(r)
-        if (a > peak) peak = a
+        if (trackPeak) {
+          const a = Math.abs(l) > Math.abs(r) ? Math.abs(l) : Math.abs(r)
+          if (a > peak) peak = a
+        }
         this.read = (this.read + 1) % this.capacity
         this.size--
       } else {
@@ -70,12 +72,19 @@ class AudioPlayerProcessor extends AudioWorkletProcessor {
     this.prebufferFrames = 2400 // ~50ms @ 48k
     this.framesSinceStats = 0
     this.lastPeak = 0
+    this.statsEnabled = true
 
     this.port.onmessage = (ev) => {
       const data = ev.data
       if (data && data.type === 'reset') {
         this.ring.clear()
         this.started = false
+        return
+      }
+      if (data && data.type === 'stats-enable') {
+        this.statsEnabled = !!data.enabled
+        this.framesSinceStats = 0
+        this.lastPeak = 0
         return
       }
       if (data instanceof ArrayBuffer) {
@@ -104,7 +113,9 @@ class AudioPlayerProcessor extends AudioWorkletProcessor {
       }
     }
 
-    const peak = this.ring.pull(outL, outR, frames)
+    const peak = this.ring.pull(outL, outR, frames, this.statsEnabled)
+    if (!this.statsEnabled) return true
+
     this.lastPeak = Math.max(this.lastPeak * 0.92, peak)
     this.framesSinceStats += frames
 
