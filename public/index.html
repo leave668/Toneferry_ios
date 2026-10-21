@@ -809,85 +809,87 @@
           opacity: 0.7;
         }
       }
-
-      .power-save-veil {
-        position: fixed;
-        inset: 0;
-        z-index: 40;
-        pointer-events: none;
-        background: #000;
-        opacity: 0;
-        transition: opacity 0.5s var(--ease);
+      /* ---- 手机麦克风 / 最近连接 ---- */
+      .tf-card {
+        margin-top: var(--space-md);
+        padding: var(--space-md);
+        border-radius: var(--radius-md);
+        background: var(--glass);
+        border: 1px solid var(--glass-border);
       }
-
-      .power-save-hint {
-        position: fixed;
-        left: 50%;
-        bottom: max(28px, env(safe-area-inset-bottom));
-        z-index: 41;
-        transform: translateX(-50%);
-        pointer-events: none;
-        margin: 0;
-        padding: 6px 12px;
+      .tf-card-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-sm);
+        margin-bottom: var(--space-sm);
+      }
+      .tf-card-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--color-card-foreground);
+      }
+      .tf-card-hint {
+        margin: 0 0 var(--space-sm);
+        font-size: 12px;
+        line-height: 1.6;
+        color: var(--color-muted-foreground);
+      }
+      .tf-badge {
+        flex: none;
+        padding: 2px 10px;
         border-radius: var(--radius-full);
-        background: rgba(0, 0, 0, 0.45);
-        color: rgba(248, 250, 252, 0.55);
+        background: var(--color-muted);
+        color: var(--color-muted-foreground);
         font-size: 11px;
-        font-weight: 500;
-        letter-spacing: 0.04em;
-        opacity: 0;
-        transition: opacity 0.5s var(--ease);
+        white-space: nowrap;
       }
-
-      html.power-save .power-save-veil {
-        opacity: 0.78;
+      .tf-badge.on {
+        background: rgba(34, 197, 94, 0.18);
+        color: var(--color-accent);
       }
-
-      html.power-save .power-save-hint {
-        opacity: 1;
+      .tf-badge.warn {
+        background: rgba(245, 158, 11, 0.18);
+        color: #f59e0b;
       }
-
-      html.power-save body {
-        background: #000;
+      .tf-row {
+        display: flex;
+        gap: 12px;
       }
-
-      html.power-save .ambient {
-        display: none;
+      .tf-row > * {
+        flex: 1;
       }
-
-      html.power-save .wave {
-        animation: none !important;
-        transform: scaleY(0.28);
-        opacity: 0.28;
+      .tf-peers {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        max-height: 168px;
+        overflow-y: auto;
       }
-
-      html.power-save .visualizer,
-      html.power-save .player-card,
-      html.power-save .connection,
-      html.power-save .live-pill,
-      html.power-save .stat,
-      html.power-save .primary-button,
-      html.power-save .secondary-button {
-        backdrop-filter: none !important;
-        -webkit-backdrop-filter: none !important;
-        box-shadow: none !important;
+      .tf-peer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-sm);
+        padding: 6px 0;
+        font-size: 12px;
+        color: var(--color-muted-foreground);
+        border-bottom: 1px dashed rgba(255, 255, 255, 0.07);
       }
-
-      html.power-save .player-card.is-live,
-      html.power-save .player-card.is-live .visualizer,
-      html.power-save .connection-dot.on,
-      html.power-save .live-pill .dot.on,
-      html.power-save .buffer-progress {
-        box-shadow: none !important;
-        transition: none !important;
+      .tf-peer:last-child {
+        border-bottom: none;
       }
-
-      html.power-save .hero-title {
-        text-shadow: none;
+      .tf-peer-ip {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--color-card-foreground);
       }
-
-      html.power-save .footer {
-        visibility: hidden;
+      .tf-peer-empty {
+        font-size: 12px;
+        color: var(--color-muted-foreground);
+        padding: 6px 0;
       }
     </style>
   </head>
@@ -942,7 +944,7 @@
               <h1 class="hero-title">系统音频<br />实时收听</h1>
               <p class="hero-description">
                 通过 WASAPI Loopback 获取 Windows 正在播放的系统音频，经
-                WebSocket 实时传输到当前设备。
+                WebSocket 实时传输到当前设备。锁屏 / 息屏后继续播放，通知栏可暂停。
               </p>
             </div>
           </div>
@@ -993,18 +995,42 @@
               停止
             </button>
           </div>
+
+          <!-- 手机 → 电脑 麦克风 -->
+          <section class="tf-card" id="micCard">
+            <div class="tf-card-head">
+              <span class="tf-card-title">手机麦克风 → 电脑</span>
+              <span class="tf-badge" id="micBadge">未开启</span>
+            </div>
+            <p class="tf-card-hint" id="micHint">
+              手机说话，电脑扬声器出声。出于安全，必须在电脑端手动授权一次才会真正开麦。
+            </p>
+            <div class="tf-row">
+              <button id="btnMic" class="secondary-button" type="button">开启麦克风</button>
+              <button id="btnMicGrant" class="primary-button" type="button" hidden>授权</button>
+            </div>
+          </section>
+
+          <!-- 最近连接 -->
+          <section class="tf-card" id="peersCard">
+            <div class="tf-card-head">
+              <span class="tf-card-title">最近连接</span>
+              <span class="tf-badge" id="peersBadge">0</span>
+            </div>
+            <ul class="tf-peers" id="peersList">
+              <li class="tf-peer-empty">暂无记录</li>
+            </ul>
+          </section>
         </div>
       </section>
 
       <div class="footer">
         <span class="chip">实时传输</span>
+        <span class="chip">锁屏播放</span>
         <span class="chip">WebSocket</span>
         <span class="chip">WASAPI Loopback</span>
       </div>
     </main>
-
-    <div class="power-save-veil" aria-hidden="true"></div>
-    <p class="power-save-hint">轻触屏幕恢复亮度</p>
 
     <script src="./NoSleep.min.js"></script>
     <script type="module">
@@ -1031,13 +1057,10 @@
 
         const live = running || connected;
 
-        visualizer.classList.toggle(
-          "active",
-          running && !document.documentElement.classList.contains("power-save"),
-        );
+        visualizer.classList.toggle("active", running);
         playerCard.classList.toggle("is-live", live);
         statusDot.classList.toggle("on", live);
-        statusBadgeDot.classList.toggle("on", live);
+        statusBadgeDot?.classList.toggle("on", live);
       };
 
       const observer = new MutationObserver(updateUI);
@@ -1048,7 +1071,6 @@
       });
 
       const syncBuffer = new MutationObserver(() => {
-        if (document.documentElement.classList.contains("power-save")) return;
         bufferText.textContent = `${buffered.textContent.trim()} frames`;
       });
       syncBuffer.observe(buffered, {
@@ -1061,12 +1083,6 @@
       buttonObserver.observe(btnStop, {
         attributes: true,
         attributeFilter: ["disabled"],
-      });
-
-      const powerSaveObserver = new MutationObserver(updateUI);
-      powerSaveObserver.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ["class"],
       });
 
       updateUI();

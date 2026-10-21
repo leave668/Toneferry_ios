@@ -23,6 +23,8 @@
     UISegmentedControl *_latencySegment;
     UILabel *_hintLabel;
     UIButton *_pipButton;
+    UIButton *_micButton;
+    UIButton *_historyButton;
     UIView *_pipHostView;
     TFPiPController *_pipController;
     TFPlayer *_player;
@@ -95,8 +97,25 @@ static NSString *const kLatencyKey = @"tf.latency";
     _pipButton.alpha = 0.45;
     [self.view addSubview:_pipButton];
 
-    _statusLabel = [self labelWithSize:15 weight:UIFontWeightMedium color:[UIColor whiteColor]];
-    _statusLabel.text = @"未连接";
+    // 手机当电脑麦克风：需要电脑端授权后才真正开麦
+    _micButton = [self buttonWithTitle:@"麦克风"
+                                 color:[UIColor colorWithRed:0.153 green:0.153 blue:0.231 alpha:1.0]
+                             textColor:[UIColor whiteColor]];
+    _micButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [_micButton addTarget:self action:@selector(onMic) forControlEvents:UIControlEventTouchUpInside];
+    _micButton.enabled = NO;
+    _micButton.alpha = 0.45;
+    [self.view addSubview:_micButton];
+
+    // 最近连接过的电脑地址
+    _historyButton = [self buttonWithTitle:@"最近地址"
+                                     color:[UIColor colorWithRed:0.153 green:0.153 blue:0.231 alpha:1.0]
+                                 textColor:[UIColor whiteColor]];
+    _historyButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [_historyButton addTarget:self action:@selector(onHistory) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_historyButton];
+
+    _statusLabel = [self labelWithSize:15 weight:UIFontWeightMedium color:[UIColor whiteColor]];    _statusLabel.text = @"未连接";
     _statusLabel.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:_statusLabel];
 
@@ -225,7 +244,10 @@ static NSString *const kLatencyKey = @"tf.latency";
     y += 60;
     _stopButton.frame = CGRectMake(pad, y, (contentW - 12) / 2, 44);
     _pipButton.frame = CGRectMake(pad + (contentW - 12) / 2 + 12, y, (contentW - 12) / 2, 44);
-    y += 56;
+    y += 52;
+    _micButton.frame = CGRectMake(pad, y, (contentW - 12) / 2, 40);
+    _historyButton.frame = CGRectMake(pad + (contentW - 12) / 2 + 12, y, (contentW - 12) / 2, 40);
+    y += 52;
     _statusLabel.frame = CGRectMake(pad, y, contentW, 22);
     y += 26;
     _statsLabel.frame = CGRectMake(pad, y, contentW, 18);
@@ -266,6 +288,7 @@ static NSString *const kLatencyKey = @"tf.latency";
         return;
     }
     [[NSUserDefaults standardUserDefaults] setObject:host forKey:@"tf.host"];
+    [self rememberHost:host];
     _player.host = host;
     _player.targetLatencyMs = kLatencyOptions[[self savedLatencyIndex]];
     [_hostField resignFirstResponder];
@@ -276,6 +299,8 @@ static NSString *const kLatencyKey = @"tf.latency";
     _stopButton.alpha = 1.0;
     _pipButton.enabled = YES;
     _pipButton.alpha = 1.0;
+    _micButton.enabled = YES;
+    _micButton.alpha = 1.0;
     [_player start];
 }
 
@@ -284,6 +309,9 @@ static NSString *const kLatencyKey = @"tf.latency";
     [_pipButton setTitle:@"悬浮窗" forState:UIControlStateNormal];
     _pipButton.enabled = NO;
     _pipButton.alpha = 0.45;
+    [_micButton setTitle:@"麦克风" forState:UIControlStateNormal];
+    _micButton.enabled = NO;
+    _micButton.alpha = 0.45;
     [_player stop];
     _startButton.enabled = YES;
     _startButton.alpha = 1.0;
@@ -302,6 +330,88 @@ static NSString *const kLatencyKey = @"tf.latency";
     }
     [_pipButton setTitle:@"启动中…" forState:UIControlStateNormal];
     [_pipController start];
+}
+
+#pragma mark - 麦克风
+
+- (void)onMic {
+    BOOL on = !_player.micEnabled;
+    [_player setMicEnabled:on];
+    if (!on) {
+        [_micButton setTitle:@"麦克风" forState:UIControlStateNormal];
+        _micButton.backgroundColor = [UIColor colorWithRed:0.153 green:0.153 blue:0.231 alpha:1.0];
+    } else {
+        [_micButton setTitle:@"请求中…" forState:UIControlStateNormal];
+    }
+}
+
+- (void)player:(TFPlayer *)player didChangeMicState:(BOOL)enabled granted:(BOOL)granted waiting:(BOOL)waiting {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!enabled) {
+            [self->_micButton setTitle:@"麦克风" forState:UIControlStateNormal];
+            self->_micButton.backgroundColor = [UIColor colorWithRed:0.153 green:0.153 blue:0.231 alpha:1.0];
+            return;
+        }
+        if (granted) {
+            [self->_micButton setTitle:@"麦克风开" forState:UIControlStateNormal];
+            self->_micButton.backgroundColor = [UIColor colorWithRed:0.13 green:0.77 blue:0.37 alpha:1.0];
+            [self->_micButton setTitleColor:[UIColor colorWithRed:0.059 green:0.09 blue:0.16 alpha:1.0]
+                                   forState:UIControlStateNormal];
+        } else if (waiting) {
+            [self->_micButton setTitle:@"等待电脑授权" forState:UIControlStateNormal];
+            self->_micButton.backgroundColor = [UIColor colorWithRed:0.96 green:0.62 blue:0.04 alpha:1.0];
+        } else {
+            [self->_micButton setTitle:@"未授权" forState:UIControlStateNormal];
+            self->_micButton.backgroundColor = [UIColor colorWithRed:0.153 green:0.153 blue:0.231 alpha:1.0];
+        }
+    });
+}
+
+#pragma mark - 最近地址
+
+static NSString *const kHostsKey = @"tf.hosts";
+static const NSUInteger kMaxHosts = 8;
+
+- (NSArray<NSString *> *)recentHosts {
+    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:kHostsKey];
+    return [a isKindOfClass:[NSArray class]] ? a : @[];
+}
+
+- (void)rememberHost:(NSString *)host {
+    if (host.length == 0) return;
+    NSMutableArray *list = [NSMutableArray arrayWithArray:[self recentHosts]];
+    [list removeObject:host];
+    [list insertObject:host atIndex:0];
+    while (list.count > kMaxHosts) [list removeLastObject];
+    [[NSUserDefaults standardUserDefaults] setObject:list forKey:kHostsKey];
+}
+
+- (void)onHistory {
+    NSArray<NSString *> *hosts = [self recentHosts];
+    if (hosts.count == 0) {
+        _statusLabel.text = @"还没有连接记录";
+        return;
+    }
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"最近连接的电脑"
+                                                                  message:nil
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    for (NSString *h in hosts) {
+        [sheet addAction:[UIAlertAction actionWithTitle:h
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+            TFViewController *s = weakSelf;
+            if (!s) return;
+            s->_hostField.text = h;
+            [[NSUserDefaults standardUserDefaults] setObject:h forKey:@"tf.host"];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    // iPad 上 ActionSheet 需要锚点
+    sheet.popoverPresentationController.sourceView = _historyButton;
+    sheet.popoverPresentationController.sourceRect = _historyButton.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 #pragma mark - TFPlayerDelegate

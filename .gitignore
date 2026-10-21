@@ -17,3 +17,6 @@ ios/tools/dl/
 ios/build/
 ios/out/
 ios/sdk_fail.log
+
+# 托盘宿主构建时嵌入的服务端 exe（58MB，由 npm run build:exe 生成）
+host/assets/

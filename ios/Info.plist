@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.5.0</string>
+	<string>1.6.0</string>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>7</string>
 	<key>CFBundleIconFiles</key>
 	<array>
 		<string>Icon-60@2x</string>
@@ -54,6 +54,8 @@
 	<string>UIStatusBarStyleLightContent</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>需要访问局域网内的电脑，以接收实时系统音频。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>开启「麦克风」后，手机的声音会实时送到电脑播放；只有电脑端授权后才会采集。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

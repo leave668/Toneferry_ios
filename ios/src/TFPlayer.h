@@ -26,6 +26,8 @@ typedef NS_ENUM(NSInteger, TFPlayerState) {
 @optional
 /// 诊断数据：packetRate / backlogMs / inFlightMs / dropped / underruns / packets
 - (void)player:(TFPlayer *)player didUpdateDiagnostics:(NSDictionary<NSString *, NSNumber *> *)diag;
+/// 麦克风状态变化：enabled=用户开了开关，granted=电脑已授权，waiting=在等电脑授权
+- (void)player:(TFPlayer *)player didChangeMicState:(BOOL)enabled granted:(BOOL)granted waiting:(BOOL)waiting;
 @end
 
 @interface TFPlayer : NSObject
@@ -41,5 +43,12 @@ typedef NS_ENUM(NSInteger, TFPlayerState) {
 
 - (void)start;
 - (void)stop;
+
+/// 手机当电脑麦克风：开启/关闭上行采集。
+/// 真正开麦要等电脑端授权（收到 mic-state.granted=YES），未授权时只是「请求中」。
+- (void)setMicEnabled:(BOOL)on;
+@property (nonatomic, readonly) BOOL micEnabled;
+@property (nonatomic, readonly) BOOL micGranted;
+@property (nonatomic, readonly) BOOL micWaiting;
 
 @end

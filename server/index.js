@@ -6,6 +6,8 @@ import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { spawn, exec } from 'node:child_process'
 import { WebSocketServer, WebSocket } from 'ws'
+import { createPeerStore } from './peers.js'
+import { createMicChannel, resolvePlayerPath, MIC_CHANNEL_ID, MIC_SAMPLE_RATE } from './mic.js'
 
 /** Prefer LAN IPv4 (e.g. 192.168.x.x) for phone access on the same Wi‑Fi. */
 function getLanIPv4() {
@@ -54,7 +56,7 @@ function materializeCaptureExe(embeddedPath) {
   if (!process.pkg) return embeddedPath
 
   const destDir = path.join(os.tmpdir(), 'toneferry-runtime')
-  const dest = path.join(destDir, 'audio-capture.exe')
+  const dest = path.join(destDir, path.basename(embeddedPath))
   fs.mkdirSync(destDir, { recursive: true })
 
   const srcStat = fs.statSync(embeddedPath)
@@ -74,6 +76,7 @@ function materializeCaptureExe(embeddedPath) {
 const ROOT = resolveRoot()
 const PUBLIC_DIR = path.join(ROOT, 'public')
 const CAPTURE_EXE = materializeCaptureExe(path.join(ROOT, 'bin', 'audio-capture.exe'))
+const PLAYER_EXE = materializeCaptureExe(path.join(ROOT, 'bin', 'audio-play.exe'))
 
 const HTTP_PORT = Number(process.env.PORT || 3088)
 const WS_PATH = '/audio'
@@ -81,6 +84,46 @@ const OPEN_BROWSER = process.env.TONEFERRY_NO_BROWSER !== '1'
 
 /** @type {{ sampleRate: number, channels: number, format: string } | null} */
 let audioConfig = null
+
+/**
+ * 托盘托管时没有控制台，stdout 是一个没人读的管道：
+ * 写满 64KB 缓冲区后 console.log 会阻塞，整个服务端卡死。
+ * 所以只要给了日志文件，就把 stdout/stderr 改写到文件里。
+ */
+const LOG_FILE = process.env.TONEFERRY_LOG_FILE
+if (LOG_FILE) {
+  try {
+    const fd = fs.openSync(LOG_FILE, 'a')
+    const sink = (chunk, enc, cb) => {
+      try {
+        fs.writeSync(fd, typeof chunk === 'string' ? chunk : Buffer.from(chunk))
+      } catch {
+        /* 磁盘满 / 被删就静默 */
+      }
+      if (typeof enc === 'function') enc()
+      else if (typeof cb === 'function') cb()
+      return true
+    }
+    process.stdout.write = sink
+    process.stderr.write = sink
+  } catch {
+    /* 打不开日志就维持原样 */
+  }
+}
+
+const peers = createPeerStore()
+const mic = createMicChannel({
+  playerPath: PLAYER_EXE,
+  log: (m) => console.log(`  ${c.dim}${m}${c.reset}`),
+  onState: (s) => {
+    broadcastJson({ type: 'mic-state', ...s })
+    // 手机请求开麦 → 通知所有电脑端（浏览器 + 托盘轮询）来授权
+    if (s.pending) {
+      broadcastJson({ type: 'mic-request', ip: s.pendingIp })
+      console.log(`  ${c.yellow}[mic] ${s.pendingIp || '手机'} 请求使用麦克风，等待电脑端授权${c.reset}`)
+    }
+  },
+})
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
@@ -160,6 +203,8 @@ const MAX_BUFFERED_BYTES = 512 * 1024
 let streamEnabled = false
 /** 谁点的开始（浏览器连接）。发起方全断开时自动关闸，避免采集空转。 */
 const streamOwners = new Set()
+/** 托盘 / 网页 API 触发的推流用这个哨兵占位，不会随连接断开被清掉 */
+const API_OWNER = { api: true }
 
 function setStreamEnabled(on, owner) {
   if (on) {
@@ -280,8 +325,125 @@ function printStartupBanner(host, port) {
   console.log('')
 }
 
+function sendJson(res, code, obj) {
+  const body = JSON.stringify(obj)
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  })
+  res.end(body)
+}
+
+/** 控制类接口只允许本机调用：不能让局域网里的手机自己给自己授权麦克风。 */
+function isLoopback(req) {
+  const ip = String((req.socket && req.socket.remoteAddress) || '')
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
+}
+
+function readBody(req, limit = 64 * 1024) {
+  return new Promise((resolve) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (c2) => {
+      size += c2.length
+      if (size > limit) {
+        req.destroy()
+        resolve({})
+        return
+      }
+      chunks.push(c2)
+    })
+    req.on('end', () => {
+      if (!chunks.length) return resolve({})
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch {
+        resolve({})
+      }
+    })
+    req.on('error', () => resolve({}))
+  })
+}
+
+function statusSnapshot() {
+  const host = getLanIPv4()
+  return {
+    ok: true,
+    host,
+    port: HTTP_PORT,
+    url: `http://${host}:${HTTP_PORT}`,
+    streamEnabled,
+    captureRunning: !!captureProc,
+    mic: mic.state(),
+    nativeCount: nativeClientCount(),
+    clients: wss ? wss.clients.size : 0,
+    peers: peers.list(),
+  }
+}
+
+async function handleApi(req, res, urlPath) {
+  const method = (req.method || 'GET').toUpperCase()
+
+  if (urlPath === '/api/status' && method === 'GET') {
+    sendJson(res, 200, { ...statusSnapshot(), local: isLoopback(req) })
+    return
+  }
+  if (urlPath === '/api/peers' && method === 'GET') {
+    sendJson(res, 200, { ok: true, peers: peers.list() })
+    return
+  }
+
+  // 以下都是写操作，必须来自本机
+  if (!isLoopback(req)) {
+    sendJson(res, 403, { ok: false, error: '控制接口仅限本机访问' })
+    return
+  }
+
+  if (urlPath === '/api/control' && method === 'POST') {
+    const body = await readBody(req)
+    const action = String(body.action || '')
+    switch (action) {
+      case 'start':
+        setStreamEnabled(true, API_OWNER)
+        break
+      case 'stop':
+        setStreamEnabled(false)
+        break
+      case 'grant-mic':
+        mic.grant()
+        break
+      case 'deny-mic':
+        mic.deny()
+        break
+      case 'revoke-mic':
+        mic.revoke()
+        break
+      case 'clear-peers':
+        peers.clear()
+        break
+      case 'shutdown':
+        sendJson(res, 200, { ok: true, action })
+        setTimeout(() => shutdown('tray'), 120)
+        return
+      default:
+        sendJson(res, 400, { ok: false, error: `未知操作：${action}` })
+        return
+    }
+    sendJson(res, 200, statusSnapshot())
+    return
+  }
+
+  sendJson(res, 404, { ok: false, error: 'not found' })
+}
+
 const server = http.createServer((req, res) => {
   const urlPath = decodeURIComponent((req.url || '/').split('?')[0])
+
+  // ---- 本地控制 API（托盘宿主 / 网页端共用）----
+  if (urlPath.startsWith('/api/')) {
+    handleApi(req, res, urlPath)
+    return
+  }
   const relUrl = urlPath === '/' ? '/index.html' : urlPath
   const filePath = path.normalize(path.join(PUBLIC_DIR, relUrl))
   const rel = path.relative(PUBLIC_DIR, filePath)
@@ -306,6 +468,11 @@ const wss = new WebSocketServer({ server, path: WS_PATH })
 wss.on('connection', (ws, req) => {
   ws.isAlive = true
   ws.isNative = isNativeClient(req)
+  ws.peerIp = peers.touch(
+    req && req.socket ? req.socket.remoteAddress : '',
+    ws.isNative ? 'app' : 'browser',
+    String((req && req.headers && req.headers['user-agent']) || ''),
+  )
   // 默认收 PCM；浏览器被手机顶掉后会发 wants-audio:false，只保留在线监测
   ws.wantsAudio = true
   ws.on('pong', () => {
@@ -334,7 +501,14 @@ wss.on('connection', (ws, req) => {
   broadcastPeerMode();
 
   ws.on('message', (data, isBinary) => {
-    if (isBinary) return
+    // 上行音频：前 4 字节小端通道号（1 = 麦克风），后面是 f32 PCM
+    if (isBinary) {
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data)
+      if (buf.length > 4 && buf.readUInt32LE(0) === MIC_CHANNEL_ID) {
+        mic.write(ws, buf.subarray(4))
+      }
+      return
+    }
     const text = typeof data === 'string' ? data : data.toString('utf8')
     try {
       const msg = JSON.parse(text)
@@ -358,6 +532,13 @@ wss.on('connection', (ws, req) => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'stream-state', enabled: streamEnabled }))
         }
+      } else if (msg.type === 'mic-open') {
+        const r = mic.open(ws)
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'mic-state', ...mic.state(), ...r }))
+        }
+      } else if (msg.type === 'mic-close') {
+        mic.close(ws)
       } else if (msg.type === 'ping') {
         // 客户端心跳：锁屏时用它维持连接并确认下行仍通畅
         if (ws.readyState === WebSocket.OPEN) {
@@ -372,6 +553,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     const left = Math.max(wss.clients.size - 1, 0)
     console.log(`  ${c.dim}[ws] ${who} 断开（剩余 ${left} 路）${c.reset}`)
+    mic.detach(ws)
     // 发起推流的页面关掉后必须关闸，否则采集继续空转、手机继续收
     if (streamOwners.delete(ws)) setStreamEnabled(streamOwners.size > 0)
     // close 事件里 clients 集合可能还没更新完，挪到下一轮事件循环再算
@@ -506,7 +688,8 @@ server.on('error', (err) => {
 })
 
 function holdAndExit(code = 1) {
-  if (process.pkg) {
+  // 托盘托管模式下没有控制台：等回车会永远挂住，直接退
+  if (process.pkg && !process.env.TONEFERRY_LOG_FILE && process.stdout.isTTY) {
     console.error('')
     console.error('按回车键退出…')
     try {
@@ -527,6 +710,11 @@ function shutdown() {
   if (shuttingDown) return
   shuttingDown = true
   console.log('shutting down...')
+  try {
+    mic.shutdown()
+  } catch {
+    /* ignore */
+  }
   if (captureProc && !captureProc.killed) {
     captureProc.kill()
   }

@@ -18,6 +18,14 @@ const channelsEl = document.getElementById('channels')
 const bufferedEl = document.getElementById('buffered')
 const levelEl = document.getElementById('level')
 
+/* 手机麦克风 / 最近连接 */
+const micBadge = document.getElementById('micBadge')
+const micHint = document.getElementById('micHint')
+const btnMic = document.getElementById('btnMic')
+const btnMicGrant = document.getElementById('btnMicGrant')
+const peersList = document.getElementById('peersList')
+const peersBadge = document.getElementById('peersBadge')
+
 /** true = 保持屏幕常亮（会阻止锁屏）。锁屏播放场景应为 false。 */
 const KEEP_SCREEN_ON = false
 const HEARTBEAT_MS = 20000
@@ -602,6 +610,12 @@ function connectWs() {
         applyAudioConfig(msg)
       } else if (msg.type === 'peer-mode') {
         applyPeerMode(Number(msg.nativeCount) || 0)
+      } else if (msg.type === 'mic-state') {
+        applyMicState(msg)
+      } else if (msg.type === 'mic-request') {
+        micPending = true
+        setMicUI()
+        refreshPeers()
       } else if (msg.type === 'stream-state') {
         // 只处理「确认开闸之后又被关掉」的情况（另一个标签页点了停止）。
         // 刚连上时服务端会先发一次 enabled:false，那是初始态，不能当成停止。
@@ -946,6 +960,318 @@ window.addEventListener('online', () => {
  *   __toneferry.state
  * 或在电脑 Chrome 远程调试里查看。锁屏无声时先看 sinkHasStream / audioContext。
  */
+/* ------------------------------------------------------------------ */
+/* 手机麦克风 → 电脑                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 链路：getUserMedia → AudioWorklet（重采样到 48k 单声道 f32）→ WebSocket 二进制帧
+ *       → 电脑端 audio-play.exe → 扬声器。
+ * 授权：默认关闭，必须在电脑端（托盘菜单或本页按钮）授权一次。
+ */
+
+/** 上行帧头：4 字节小端通道号，1 = 麦克风；后面才是 f32 PCM（4 字节对齐） */
+const MIC_CHANNEL = 1
+const MIC_FRAME_SAMPLES = 960 // 20ms @48k
+
+/** 本页是否跑在电脑上（只有电脑能授权，手机页面只负责开麦） */
+let isLocalPage = false
+/** 用户意图：想让手机当麦克风 */
+let micWanted = false
+/** 服务端当前是否已授权 */
+let micGranted = false
+let micPending = false
+/** @type {MediaStream | null} */
+let micStream = null
+/** @type {AudioContext | null} */
+let micCtx = null
+/** @type {AudioWorkletNode | null} */
+let micNode = null
+let micSink = null
+let micWorkletUrl = null
+let micFrames = 0
+
+const MIC_WORKLET = `
+class TFMicrophone extends AudioWorkletProcessor {
+  constructor() {
+    super()
+    this.step = 48000 / sampleRate
+    this.frac = 0
+    this.buf = new Float32Array(960)
+    this.n = 0
+  }
+  flush() {
+    if (this.n > 0) {
+      this.port.postMessage(this.buf.slice(0, this.n))
+      this.n = 0
+    }
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0]
+    if (!ch) return true
+    // 最近邻重采样到 48k；设备本来就是 48k 时 step=1，等于直通
+    for (let i = 0; i < ch.length; i++) {
+      this.frac += this.step
+      while (this.frac >= 1) {
+        this.frac -= 1
+        this.buf[this.n++] = ch[i]
+        if (this.n >= 960) this.flush()
+      }
+    }
+    return true
+  }
+}
+registerProcessor('tf-mic', TFMicrophone)
+`
+
+function setMicUI() {
+  if (!micBadge) return
+  if (micGranted && micWanted) {
+    micBadge.textContent = '使用中'
+    micBadge.className = 'tf-badge on'
+    btnMic.textContent = '关闭麦克风'
+    micHint.textContent = '正在把手机麦克风的声音送到电脑扬声器。'
+  } else if (micPending) {
+    micBadge.textContent = '等待授权'
+    micBadge.className = 'tf-badge warn'
+    btnMic.textContent = '取消'
+    micHint.textContent = isLocalPage
+      ? '有手机请求开麦，点右边「授权」后才会真正出声。'
+      : '已向电脑发送请求，请在电脑的托盘图标或网页上点「授权」。'
+  } else if (micGranted) {
+    micBadge.textContent = '已授权'
+    micBadge.className = 'tf-badge on'
+    btnMic.textContent = '开启麦克风'
+    micHint.textContent = '电脑已授权，点一下就能开始说话。'
+  } else {
+    micBadge.textContent = '未开启'
+    micBadge.className = 'tf-badge'
+    btnMic.textContent = '开启麦克风'
+    micHint.textContent =
+      '手机说话，电脑扬声器出声。出于安全，必须在电脑端手动授权一次才会真正开麦。'
+  }
+  if (btnMicGrant) btnMicGrant.hidden = !(isLocalPage && micPending)
+}
+
+async function ensureMicWorklet(ctx) {
+  if (!micWorkletUrl) {
+    micWorkletUrl = URL.createObjectURL(new Blob([MIC_WORKLET], { type: 'text/javascript' }))
+  }
+  await ctx.audioWorklet.addModule(micWorkletUrl)
+}
+
+function sendMicFrame(f32) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+  if (!micGranted) return
+  const buf = new ArrayBuffer(4 + f32.length * 4)
+  new DataView(buf).setUint32(0, MIC_CHANNEL, true)
+  new Float32Array(buf, 4).set(f32)
+  try {
+    ws.send(buf)
+    micFrames += 1
+  } catch {
+    /* ignore */
+  }
+}
+
+async function startMicCapture() {
+  if (micStream) return
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    micHint.textContent = '当前浏览器不支持麦克风采集（需要 HTTPS 或 localhost）。'
+    return
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
+  } catch (err) {
+    micHint.textContent = `无法打开麦克风：${err.message || err}`
+    micWanted = false
+    setMicUI()
+    return
+  }
+
+  micCtx = new AudioContext({ sampleRate: 48000 })
+  if (micCtx.state === 'suspended') await micCtx.resume()
+  await ensureMicWorklet(micCtx)
+
+  micNode = new AudioWorkletNode(micCtx, 'tf-mic')
+  micNode.port.onmessage = (ev) => sendMicFrame(ev.data)
+  const src = micCtx.createMediaStreamSource(micStream)
+  src.connect(micNode)
+
+  // AudioWorkletNode 只有连到 destination 才会被驱动；用 0 增益避免自己外放
+  micSink = micCtx.createGain()
+  micSink.gain.value = 0
+  micNode.connect(micSink)
+  micSink.connect(micCtx.destination)
+}
+
+async function stopMicCapture() {
+  if (micNode) {
+    try {
+      micNode.port.onmessage = null
+      micNode.disconnect()
+    } catch {
+      /* ignore */
+    }
+    micNode = null
+  }
+  if (micSink) {
+    try {
+      micSink.disconnect()
+    } catch {
+      /* ignore */
+    }
+    micSink = null
+  }
+  if (micStream) {
+    for (const t of micStream.getTracks()) t.stop()
+    micStream = null
+  }
+  if (micCtx) {
+    try {
+      await micCtx.close()
+    } catch {
+      /* ignore */
+    }
+    micCtx = null
+  }
+}
+
+async function toggleMic() {
+  if (micWanted) {
+    micWanted = false
+    await stopMicCapture()
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'mic-close' }))
+    }
+    micGranted = false
+    micPending = false
+    setMicUI()
+    return
+  }
+
+  micWanted = true
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    micHint.textContent = '请先点「开始收听」建立连接，再开麦克风。'
+    micWanted = false
+    setMicUI()
+    return
+  }
+  ws.send(JSON.stringify({ type: 'mic-open' }))
+  setMicUI()
+}
+
+function applyMicState(msg) {
+  const wasGranted = micGranted
+  micGranted = !!msg.granted
+  micPending = !!msg.pending
+  setMicUI()
+
+  if (micWanted && micGranted && !wasGranted) {
+    startMicCapture().catch((e) => {
+      micHint.textContent = `麦克风启动失败：${e.message || e}`
+    })
+  }
+  if (!micGranted && micStream) {
+    stopMicCapture().catch(() => {})
+  }
+}
+
+btnMic?.addEventListener('click', () => {
+  toggleMic().catch(console.error)
+})
+
+btnMicGrant?.addEventListener('click', () => {
+  control('grant-mic').catch(console.error)
+})
+
+/* ------------------------------------------------------------------ */
+/* 本地控制 API / 最近连接                                             */
+/* ------------------------------------------------------------------ */
+
+async function control(action) {
+  try {
+    const r = await fetch('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })
+    const j = await r.json()
+    if (j && j.mic) applyMicState(j.mic)
+    if (j && typeof j.streamEnabled === 'boolean') {
+      // 托盘那边点了开始/停止，同步一下按钮状态
+      if (j.streamEnabled && !listening) {
+        setStatus('已由电脑端开启推流')
+      }
+    }
+    refreshPeers()
+    return j
+  } catch (err) {
+    setStatus(`操作失败：${err.message || err}`)
+    return null
+  }
+}
+
+function relTime(ts) {
+  const diff = Math.max(0, Date.now() - ts)
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
+  return `${Math.floor(diff / 86_400_000)} 天前`
+}
+
+function renderPeers(list) {
+  if (!peersList) return
+  peersBadge.textContent = String(list.length)
+  if (!list.length) {
+    peersList.innerHTML = '<li class="tf-peer-empty">暂无记录</li>'
+    return
+  }
+  peersList.innerHTML = ''
+  for (const p of list.slice(0, 8)) {
+    const li = document.createElement('li')
+    li.className = 'tf-peer'
+    const kind = p.kind === 'app' ? 'App' : '网页'
+    li.innerHTML =
+      `<span class="tf-peer-ip">${p.ip}</span>` +
+      `<span>${kind} · ${relTime(p.lastSeen)}</span>`
+    peersList.appendChild(li)
+  }
+}
+
+async function refreshPeers() {
+  try {
+    const r = await fetch('/api/peers', { cache: 'no-store' })
+    const j = await r.json()
+    renderPeers(Array.isArray(j.peers) ? j.peers : [])
+  } catch {
+    /* 服务端不在就静默 */
+  }
+}
+
+async function refreshLocalFlag() {
+  try {
+    const r = await fetch('/api/status', { cache: 'no-store' })
+    const j = await r.json()
+    isLocalPage = !!j.local
+    if (j.mic) applyMicState(j.mic)
+    setMicUI()
+  } catch {
+    isLocalPage = false
+  }
+}
+
+refreshLocalFlag()
+refreshPeers()
+setInterval(refreshPeers, 8000)
+
 window.__toneferry = {
   get state() {
     return {

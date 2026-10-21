@@ -214,6 +214,18 @@ static OSStatus pipeRender(TFAudioPipe *p,
     BOOL _connecting;
     /// 电脑网页端的总闸状态（false 时服务端不下发音频）
     BOOL _streamEnabled;
+
+    // ---- 手机麦克风上行 ----
+    /// 用户是否点了「麦克风」开关
+    BOOL _micEnabled;
+    /// 电脑端是否已授权
+    BOOL _micGranted;
+    /// 已请求、正在等电脑授权
+    BOOL _micWaiting;
+    AVAudioEngine *_micEngine;
+    AVAudioConverter *_micConverter;
+    AVAudioFormat *_micOutFormat;
+    unsigned long long _micFrames;
     BOOL _reconnectPending;
     NSUInteger _reconnectAttempt;
     double _streamRate;
@@ -340,6 +352,10 @@ static OSStatus pipeRender(TFAudioPipe *p,
         self->_wantPlaying = NO;
         self->_reconnectPending = NO;
         self->_connecting = NO;
+        self->_micEnabled = NO;
+        self->_micGranted = NO;
+        self->_micWaiting = NO;
+        [self stopMicEngine];
         [self closeTask];
         [self stopTimers];
         [self teardownGraph];
@@ -354,6 +370,170 @@ static OSStatus pipeRender(TFAudioPipe *p,
             [MPNowPlayingInfoCenter defaultCenter].playbackState = MPNowPlayingPlaybackStateStopped;
         });
     });
+}
+
+#pragma mark - 麦克风（手机 → 电脑）
+
+- (BOOL)micEnabled { return _micEnabled; }
+- (BOOL)micGranted { return _micGranted; }
+- (BOOL)micWaiting { return _micWaiting; }
+
+- (void)setMicEnabled:(BOOL)on {
+    dispatch_async(_workQueue, ^{
+        self->_micEnabled = on;
+        if (!on) {
+            self->_micGranted = NO;
+            self->_micWaiting = NO;
+            [self stopMicEngine];
+            [self sendJSON:@{ @"type": @"mic-close" }];
+            [self notifyMicState];
+            return;
+        }
+        // 请求开麦：未授权时服务端会回 mic-state(granted:NO,pending:YES)
+        self->_micWaiting = YES;
+        [self sendJSON:@{ @"type": @"mic-open" }];
+        [self notifyMicState];
+    });
+}
+
+- (void)notifyMicState {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id<TFPlayerDelegate> d = self.delegate;
+        if ([d respondsToSelector:@selector(player:didChangeMicState:granted:waiting:)]) {
+            [d player:self didChangeMicState:self->_micEnabled granted:self->_micGranted waiting:self->_micWaiting];
+        }
+    });
+}
+
+- (void)applyMicState:(NSDictionary *)msg {
+    BOOL granted = [msg[@"granted"] boolValue];
+    BOOL active = [msg[@"active"] boolValue];
+    BOOL pending = [msg[@"pending"] boolValue];
+    BOOL wasGranted = _micGranted;
+    _micGranted = granted;
+    _micWaiting = !granted && pending;
+
+    if (_micEnabled && granted && (!wasGranted || (active && !_micEngine))) {
+        [self startMicEngine];
+    }
+    if (!granted) {
+        [self stopMicEngine];
+    }
+    [self notifyMicState];
+}
+
+- (void)startMicEngine {
+    if (_micEngine) return;
+
+    // 播放 + 录音必须用 playAndRecord，否则 inputNode 拿不到数据
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setCategory:AVAudioSessionCategoryPlayAndRecord
+             withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker |
+                         AVAudioSessionCategoryOptionAllowBluetooth
+                   error:nil];
+    [session setActive:YES error:nil];
+
+    AVAudioEngine *engine = [[AVAudioEngine alloc] init];
+    AVAudioInputNode *input = engine.inputNode;
+    AVAudioFormat *inFormat = [input outputFormatForBus:0];
+    if (!inFormat || inFormat.sampleRate <= 0) {
+        NSLog(@"[mic] 输入格式不可用");
+        return;
+    }
+
+    _micOutFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
+                                                     sampleRate:48000
+                                                       channels:1
+                                                    interleaved:NO];
+    _micConverter = [[AVAudioConverter alloc] initFromFormat:inFormat toFormat:_micOutFormat];
+    if (!_micConverter) {
+        NSLog(@"[mic] 无法创建重采样器 %@", inFormat);
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    AVAudioConverter *converter = _micConverter;
+    AVAudioFormat *outFormat = _micOutFormat;
+    double inRate = inFormat.sampleRate;
+
+    [input installTapOnBus:0
+                bufferSize:960
+                    format:inFormat
+                     block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+        TFPlayer *s = weakSelf;
+        if (!s || !converter || !outFormat) return;
+        AVAudioFrameCount cap = (AVAudioFrameCount)(buffer.frameLength * 48000.0 / inRate) + 64;
+        AVAudioPCMBuffer *out = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFormat
+                                                            frameCapacity:cap];
+        __block BOOL supplied = NO;
+        NSError *err = nil;
+        AVAudioConverterOutputStatus st = [converter convertToBuffer:out
+                                                               error:&err
+                                                  withInputFromBlock:^AVAudioBuffer *(
+                                                      AVAudioPacketCount inPackets,
+                                                      AVAudioConverterInputStatus *outStatus) {
+            if (supplied) {
+                *outStatus = AVAudioConverterInputStatus_NoDataNow;
+                return nil;
+            }
+            supplied = YES;
+            *outStatus = AVAudioConverterInputStatus_HaveData;
+            return buffer;
+        }];
+        if (st == AVAudioConverterOutputStatus_HaveData && out.frameLength > 0) {
+            [s sendMicBuffer:out];
+        }
+    }];
+
+    [engine prepare];
+    NSError *startErr = nil;
+    if (![engine startAndReturnError:&startErr]) {
+        NSLog(@"[mic] 采集启动失败: %@", startErr);
+        [input removeTapOnBus:0];
+        return;
+    }
+    _micEngine = engine;
+    NSLog(@"[mic] 上行采集已启动 %.0fHz → 48000Hz", inRate);
+}
+
+- (void)stopMicEngine {
+    if (!_micEngine) return;
+    [_micEngine.inputNode removeTapOnBus:0];
+    [_micEngine stop];
+    _micEngine = nil;
+    _micConverter = nil;
+    // 回到纯播放类别，避免录音路由影响下行音质
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setCategory:AVAudioSessionCategoryPlayback
+             withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                   error:nil];
+    [session setActive:YES error:nil];
+}
+
+- (void)sendMicBuffer:(AVAudioPCMBuffer *)buffer {
+    if (!_micGranted) return;
+    NSURLSessionWebSocketTask *task = _task;
+    if (!task || task.state != NSURLSessionTaskStateRunning) return;
+    float *src = buffer.floatChannelData ? buffer.floatChannelData[0] : NULL;
+    if (!src) return;
+    NSUInteger frames = buffer.frameLength;
+    if (frames == 0) return;
+
+    // 4 字节小端通道号（1 = 麦克风）+ 裸 Float32 PCM
+    NSMutableData *data = [NSMutableData dataWithCapacity:4 + frames * 4];
+    uint32_t channel = 1;
+    [data appendBytes:&channel length:4];
+    [data appendBytes:src length:frames * 4];
+
+    [task sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithData:data]
+    completionHandler:^(NSError *error) {
+        if (error) {
+            dispatch_async(self->_workQueue, ^{
+                NSLog(@"[mic] 上行发送失败: %@", error.localizedDescription);
+            });
+        }
+    }];
+    _micFrames += 1;
 }
 
 #pragma mark - 状态
@@ -752,6 +932,8 @@ static OSStatus pipeRender(TFAudioPipe *p,
         } else if (_pipe && !atomic_load_explicit(&_pipe->started, memory_order_relaxed)) {
             [self setState:TFPlayerStateBuffering detail:@"缓冲中…"];
         }
+    } else if ([type isEqualToString:@"mic-state"]) {
+        [self applyMicState:msg];
     } else if ([type isEqualToString:@"error"]) {
         NSString *m = msg[@"message"];
         [self setState:TFPlayerStateFailed detail:(m.length ? m : @"服务端错误")];
