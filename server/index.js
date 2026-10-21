@@ -95,9 +95,14 @@ const mime = {
   '.webp': 'image/webp',
 }
 
-function sendConfig(ws) {
+function sendConfig(ws, force) {
   if (!audioConfig) return
   if (ws.readyState !== WebSocket.OPEN) return
+  // 同一连接同采样率只下发一次，避免客户端重复初始化播放器（重复建图会双路出声）。
+  // 但客户端被手机顶掉后本机静音、再恢复出声时会显式 get-config，那次必须重发。
+  if (!force && ws.configSent && ws.configRate === audioConfig.sampleRate) return
+  ws.configSent = true
+  ws.configRate = audioConfig.sampleRate
   ws.send(
     JSON.stringify({
       type: 'audio-config',
@@ -108,10 +113,83 @@ function sendConfig(ws) {
   )
 }
 
+/** 从握手请求里判断是不是原生 App（Toneferry-iOS/...），浏览器则带 Mozilla/... */
+function isNativeClient(req) {
+  const ua = String(req?.headers?.['user-agent'] || '')
+  return /Toneferry-iOS/i.test(ua)
+}
+
+function nativeClientCount() {
+  let n = 0
+  for (const c of wss.clients) {
+    if (c.isNative && c.readyState === WebSocket.OPEN) n++
+  }
+  return n
+}
+
+/**
+ * 手机 App 一连接就通知浏览器端停下来。
+ * 原因：浏览器外放的声音会被 WASAPI loopback 重新采进去，再推回手机播一遍，
+ * 手机听到的就是「原声 + 延迟副本」，听感即回声。这是物理闭环，只能在源头掐断。
+ */
+function broadcastPeerMode() {
+  const count = nativeClientCount()
+  const payload = JSON.stringify({ type: 'peer-mode', nativeCount: count })
+  for (const c of wss.clients) {
+    if (c.isNative) continue
+    if (c.readyState !== WebSocket.OPEN) continue
+    try {
+      c.send(payload)
+    } catch {
+      /* ignore */
+    }
+  }
+  if (count > 0) {
+    console.log(`  ${c.yellow}[ws] 手机 App 在线（${count} 路），已通知浏览器端停止播放以避免回声${c.reset}`)
+  }
+}
+
+/** 手机锁屏/后台时下行可能积压，超过阈值直接丢帧，避免内存膨胀与延迟累积。 */
+const MAX_BUFFERED_BYTES = 512 * 1024
+
+/**
+ * 总开关：电脑网页端点了「开始收听」才真正推流。
+ * 没点之前，采集照常在跑（要拿配置、要暖机），但一帧都不下发 ——
+ * 手机端此时是安静的，符合「开始收听 = 开始发送到手机」的直觉。
+ */
+let streamEnabled = false
+/** 谁点的开始（浏览器连接）。发起方全断开时自动关闸，避免采集空转。 */
+const streamOwners = new Set()
+
+function setStreamEnabled(on, owner) {
+  if (on) {
+    if (owner) streamOwners.add(owner)
+  } else if (owner) {
+    streamOwners.delete(owner)
+  } else {
+    streamOwners.clear()
+  }
+  const next = streamOwners.size > 0
+  if (next === streamEnabled) return
+  streamEnabled = next
+  console.log(
+    `  ${streamEnabled ? c.green : c.dim}[stream] 推流${streamEnabled ? '开启' : '停止'}` +
+      `（订阅方 ${streamOwners.size} 路）${c.reset}`,
+  )
+  broadcastJson({ type: 'stream-state', enabled: streamEnabled })
+}
+
 function broadcastBinary(buf) {
+  if (!streamEnabled) return
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) {
+    if (client.readyState !== WebSocket.OPEN) continue
+    // 只做在线监测的连接（浏览器被手机顶掉后留下的监控 socket）不再收 PCM
+    if (client.wantsAudio === false) continue
+    if (client.bufferedAmount > MAX_BUFFERED_BYTES) continue
+    try {
       client.send(buf, { binary: true })
+    } catch {
+      /* 客户端已断开 */
     }
   }
 }
@@ -119,8 +197,11 @@ function broadcastBinary(buf) {
 function broadcastJson(obj) {
   const text = JSON.stringify(obj)
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) {
+    if (client.readyState !== WebSocket.OPEN) continue
+    try {
       client.send(text)
+    } catch {
+      /* ignore */
     }
   }
 }
@@ -190,7 +271,8 @@ function printStartupBanner(host, port) {
   console.log(`    · ${c.yellow}请将音频输出设备设为主机自带扬声器${c.reset}（系统声音 → 输出），勿选 USB 声卡 / 耳机等外置设备`)
   console.log(`    · 手机与电脑必须在同一局域网，访客网络可能不通`)
   console.log(`    · 若打不开页面，检查 Windows 防火墙是否放行端口 ${port}`)
-  console.log(`    · 息屏 / 切后台后音频可能中断，回到页面会自动尝试恢复`)
+  console.log(`    · ${c.yellow}支持锁屏 / 息屏继续播放${c.reset}，手机通知栏可直接暂停/继续`)
+  console.log(`    · 若锁屏后无声：手机浏览器设置里允许该站点「后台播放 / 不受流量节省限制」`)
   console.log(`    · 本机也可打开：${localUrl}`)
   console.log('')
   console.log(`  ${c.dim}停止服务：关闭本窗口，或按 Ctrl+C${c.reset}`)
@@ -221,8 +303,35 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, path: WS_PATH })
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  ws.isAlive = true
+  ws.isNative = isNativeClient(req)
+  // 默认收 PCM；浏览器被手机顶掉后会发 wants-audio:false，只保留在线监测
+  ws.wantsAudio = true
+  ws.on('pong', () => {
+    ws.isAlive = true
+  })
+
   sendConfig(ws)
+  // 告诉新连接当前总闸状态：没点「开始收听」时手机端应当保持安静
+  try {
+    ws.send(JSON.stringify({ type: 'stream-state', enabled: streamEnabled }))
+  } catch {
+    /* ignore */
+  }
+
+  const who = ws.isNative ? '手机 App' : '浏览器'
+  console.log(`  ${c.dim}[ws] ${who} 已连接（当前 ${wss.clients.size} 路）${c.reset}`)
+
+  // 两路同时在播时，电脑扬声器 + 手机扬声器会形成「同一段音频的两个声源」，
+  // 听感就是回声。这里明确提示，避免误判成播放器 bug。
+  if (wss.clients.size > 1) {
+    console.log(`  ${c.yellow}[ws] 提示：当前有 ${wss.clients.size} 个客户端在收听，` +
+      `若电脑浏览器页面也在播放，请关掉它，否则会听到回声${c.reset}`)
+  }
+
+  // 手机 App 接入 → 让浏览器端自动停播（回声的源头就是浏览器外放）
+  broadcastPeerMode();
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) return
@@ -231,9 +340,28 @@ wss.on('connection', (ws) => {
       const msg = JSON.parse(text)
       if (msg.type === 'get-config') {
         if (audioConfig) {
-          sendConfig(ws)
+          sendConfig(ws, true)
         } else {
           ws.send(JSON.stringify({ type: 'status', message: 'capture config pending' }))
+        }
+      } else if (msg.type === 'wants-audio') {
+        // 浏览器被手机 App 接管后主动退订下行 PCM，避免电脑外放被 loopback 采回形成回声
+        ws.wantsAudio = msg.value !== false
+      } else if (msg.type === 'start-stream') {
+        // 网页端点了「开始收听」：从这一刻起才向手机/其他端下发音频
+        setStreamEnabled(true, ws)
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'stream-state', enabled: streamEnabled }))
+        }
+      } else if (msg.type === 'stop-stream') {
+        setStreamEnabled(false, ws)
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'stream-state', enabled: streamEnabled }))
+        }
+      } else if (msg.type === 'ping') {
+        // 客户端心跳：锁屏时用它维持连接并确认下行仍通畅
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'pong', t: Date.now() }))
         }
       }
     } catch {
@@ -241,8 +369,41 @@ wss.on('connection', (ws) => {
     }
   })
 
-  ws.on('close', () => {});
+  ws.on('close', () => {
+    const left = Math.max(wss.clients.size - 1, 0)
+    console.log(`  ${c.dim}[ws] ${who} 断开（剩余 ${left} 路）${c.reset}`)
+    // 发起推流的页面关掉后必须关闸，否则采集继续空转、手机继续收
+    if (streamOwners.delete(ws)) setStreamEnabled(streamOwners.size > 0)
+    // close 事件里 clients 集合可能还没更新完，挪到下一轮事件循环再算
+    setTimeout(broadcastPeerMode, 50)
+  })
 })
+
+/**
+ * 保活：手机锁屏后页面可能被冻结。协议层 ping 由网络栈直接回 pong，
+ * 连续收不到 pong 的连接直接断开，客户端 watchdog 会自己重连。
+ */
+const wsHeartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try {
+        ws.terminate()
+      } catch {
+        /* ignore */
+      }
+      continue
+    }
+    ws.isAlive = false
+    try {
+      ws.ping()
+    } catch {
+      /* ignore */
+    }
+  }
+}, 30000)
+wsHeartbeat.unref?.()
+
+wss.on('close', () => clearInterval(wsHeartbeat))
 
 function startCapture() {
   if (!fs.existsSync(CAPTURE_EXE)) {
@@ -273,10 +434,8 @@ function startCapture() {
             channels: Number(msg.channels) || 2,
             format: msg.format || 'f32',
           }
-          broadcastJson({
-            type: 'audio-config',
-            ...audioConfig,
-          })
+          // 逐连接下发（带采样率去重），避免已初始化的客户端被重复建图
+          for (const client of wss.clients) sendConfig(client)
         } else if (msg.type === 'error') {
           console.error('[capture]', msg.message, msg.hr ?? '')
           broadcastJson({ type: 'error', message: msg.message })

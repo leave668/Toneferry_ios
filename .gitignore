@@ -9,3 +9,11 @@ assets/
 *.ilk
 blog.md
 .DS_Store
+
+# iOS 交叉编译产物与第三方工具链（体积过大，不入库）
+ios/sdk/
+ios/tools/llvm/
+ios/tools/dl/
+ios/build/
+ios/out/
+ios/sdk_fail.log

@@ -1,3 +1,14 @@
+/**
+ * Toneferry 前端播放器
+ *
+ * 锁屏 / 息屏继续出声的三个关键点：
+ * 1. 页面不可见时不再断开 WebSocket、不再 suspend AudioContext（旧逻辑直接导致静音）。
+ * 2. AudioWorklet 的输出必须经由 <audio> 媒体元素播放（MediaStreamAudioDestinationNode），
+ *    只有走媒体元素，Android Chrome 才会把这段音频当成"正在播放的媒体"，
+ *    锁屏后继续出声，并在锁屏界面保留媒体会话。
+ * 3. watchdog 周期性自检 AudioContext / 媒体元素 / WebSocket，被打断后自动恢复。
+ */
+
 const btnStart = document.getElementById('btnStart')
 const btnStop = document.getElementById('btnStop')
 const statusDot = document.getElementById('statusDot')
@@ -6,6 +17,11 @@ const sampleRateEl = document.getElementById('sampleRate')
 const channelsEl = document.getElementById('channels')
 const bufferedEl = document.getElementById('buffered')
 const levelEl = document.getElementById('level')
+
+/** true = 保持屏幕常亮（会阻止锁屏）。锁屏播放场景应为 false。 */
+const KEEP_SCREEN_ON = false
+const HEARTBEAT_MS = 20000
+const WATCHDOG_MS = 4000
 
 /** @type {AudioContext | null} */
 let audioContext = null
@@ -17,22 +33,44 @@ let playerMode = null
 let ws = null
 /** @type {{ sampleRate: number, channels: number, format: string } | null} */
 let config = null
-/** User intends to keep listening (until Stop). */
+/** 用户意图：持续收听（直到点停止）。 */
 let listening = false
-/** Page is hidden / screen off — WS closed on purpose, wait for foreground. */
-let backgroundPaused = false
-/** @type {HTMLAudioElement | null} */
-let keepAliveAudio = null
-const NoSleepCtor = typeof window !== 'undefined' ? window.NoSleep : undefined
-const noSleep = typeof NoSleepCtor === 'function' ? new NoSleepCtor() : null
+/**
+ * 是否真的把下行 PCM 送进播放器。
+ * 与 listening 分开的原因有两个：
+ * 1. 「开始收听」是**总开关**——服务端只有收到 start-stream 才推流，
+ *    所以没点按钮时手机端是安静的；listening 记录的就是这个意图。
+ * 2. 手机 App 在线时必须让本机静音：网页外放会被 WASAPI loopback 重新采回去
+ *    再推给手机，形成「原声 + 延迟副本」的物理回声闭环。
+ *    此时 listening 仍为 true（总闸开着，手机在收），但 audioEnabled 为 false。
+ */
+let audioEnabled = false
+/** 服务端是否已确认推流开启（用于区分「刚连上时的初始 false」和「别人真的点了停止」） */
+let streamConfirmed = false
+/** 在线的手机 App 路数。>0 时本机必须静音，否则电脑外放会被 loopback 采回去形成回声。 */
+let nativePeerCount = 0
 /** @type {ReturnType<typeof setTimeout> | null} */
 let reconnectTimer = null
 let reconnectAttempt = 0
-/** Dim UI and skip meter DOM updates after idle listening. */
-let powerSave = false
-/** @type {ReturnType<typeof setTimeout> | null} */
-let powerSaveTimer = null
-const POWER_SAVE_DELAY_MS = 30_000
+/** @type {ReturnType<typeof setInterval> | null} */
+let watchdogTimer = null
+let heartbeatTick = 0
+/** 播放器初始化串行化（防止重复 config 造成并发建上下文） */
+/** @type {Promise<void> | null} */
+let initPromise = null
+
+/** 承载音频的媒体元素：锁屏媒体会话的宿主，也是音频真正出声的地方。 */
+/** @type {HTMLAudioElement | null} */
+let sinkAudio = null
+/** @type {MediaStreamAudioDestinationNode | null} */
+let sinkNode = null
+/** 当前是否成功走媒体元素通道 */
+let usingSink = false
+/** 正在切换媒体源（切换期间不要自动续播） */
+let sinkSwapping = false
+
+const NoSleepCtor = typeof window !== 'undefined' ? window.NoSleep : undefined
+const noSleep = typeof NoSleepCtor === 'function' ? new NoSleepCtor() : null
 
 const scriptQueue = {
   samples: new Float32Array(0),
@@ -59,52 +97,6 @@ const scriptQueue = {
   },
 }
 
-function setStatsEnabled(enabled) {
-  if (playerMode === 'worklet' && player) {
-    try {
-      player.port.postMessage({ type: 'stats-enable', enabled })
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function enterPowerSave() {
-  if (!listening || powerSave) return
-  powerSave = true
-  document.documentElement.classList.add('power-save')
-  setStatsEnabled(false)
-}
-
-function exitPowerSave() {
-  if (!powerSave) return
-  powerSave = false
-  document.documentElement.classList.remove('power-save')
-  setStatsEnabled(true)
-}
-
-function clearPowerSaveTimer() {
-  if (powerSaveTimer) {
-    clearTimeout(powerSaveTimer)
-    powerSaveTimer = null
-  }
-}
-
-function schedulePowerSave() {
-  clearPowerSaveTimer()
-  if (!listening) return
-  powerSaveTimer = setTimeout(() => {
-    powerSaveTimer = null
-    enterPowerSave()
-  }, POWER_SAVE_DELAY_MS)
-}
-
-function bumpIdle() {
-  if (!listening) return
-  exitPowerSave()
-  schedulePowerSave()
-}
-
 function setStatus(text, ok = false) {
   statusText.textContent = text
   statusDot.classList.toggle('on', ok)
@@ -126,54 +118,11 @@ function clearReconnect() {
   }
 }
 
-function scheduleReconnect() {
-  // Do not reconnect while page is in background / screen off
-  if (!listening || backgroundPaused || document.hidden || reconnectTimer) return
-  const delay = Math.min(8000, 500 * 2 ** reconnectAttempt)
-  reconnectAttempt += 1
-  setStatus(`连接断开，${Math.round(delay / 1000)}s 后重连…`)
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null
-    if (!listening || backgroundPaused || document.hidden) return
-    connectWs()
-  }, delay)
-}
+/* ------------------------------------------------------------------ */
+/* 媒体元素：锁屏播放的宿主                                            */
+/* ------------------------------------------------------------------ */
 
-/** Intentionally drop WS when tab backgrounds or screen locks. */
-function pauseForBackground() {
-  if (!listening) return
-  backgroundPaused = true
-  clearReconnect()
-
-  if (ws) {
-    ws.onclose = null
-    ws.onerror = null
-    ws.onmessage = null
-    try {
-      ws.close()
-    } catch {
-      /* ignore */
-    }
-    ws = null
-  }
-
-  if (playerMode === 'worklet' && player) {
-    try {
-      player.port.postMessage({ type: 'reset' })
-    } catch {
-      /* ignore */
-    }
-  }
-  scriptQueue.clear()
-
-  if (audioContext && audioContext.state === 'running') {
-    audioContext.suspend().catch(() => {})
-  }
-
-  setStatus('已暂停（后台 / 息屏）')
-}
-
-/** Tiny silent WAV — marks page as "media playing" on many Android browsers. */
+/** 极短静音 WAV —— 手势内让 <audio> 进入真正的播放态。 */
 function silentWavDataUri(seconds = 2, sampleRate = 8000) {
   const n = sampleRate * seconds
   const dataBytes = n * 2
@@ -200,46 +149,153 @@ function silentWavDataUri(seconds = 2, sampleRate = 8000) {
   return `data:audio/wav;base64,${btoa(bin)}`
 }
 
-async function startKeepAliveMedia() {
-  if (!keepAliveAudio) {
-    keepAliveAudio = new Audio(silentWavDataUri())
-    keepAliveAudio.loop = true
-    keepAliveAudio.volume = 0.01
-    keepAliveAudio.setAttribute('playsinline', '')
-  }
-  try {
-    await keepAliveAudio.play()
-  } catch (err) {
-    console.warn('keepalive audio play failed', err)
-  }
+function getSinkAudio() {
+  if (sinkAudio) return sinkAudio
 
-  if ('mediaSession' in navigator) {
-    try {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: '系统音频推流',
-        artist: 'Toneferry',
-        album: 'Loopback',
-      })
-      navigator.mediaSession.playbackState = 'playing'
-      navigator.mediaSession.setActionHandler('pause', () => {
-        stop().catch(console.error)
-      })
-      navigator.mediaSession.setActionHandler('stop', () => {
-        stop().catch(console.error)
-      })
-      navigator.mediaSession.setActionHandler('play', () => {
-        if (!listening) start().catch(console.error)
-      })
-    } catch {
-      /* ignore unsupported handlers */
-    }
+  const el = document.createElement('audio')
+  el.id = 'tfSink'
+  el.setAttribute('playsinline', '')
+  el.setAttribute('webkit-playsinline', '')
+  el.setAttribute('aria-hidden', 'true')
+  el.autoplay = true
+  el.preload = 'auto'
+  el.volume = 1
+  el.muted = false
+  el.style.position = 'fixed'
+  el.style.width = '1px'
+  el.style.height = '1px'
+  el.style.opacity = '0'
+  el.style.pointerEvents = 'none'
+  el.style.left = '-9999px'
+  el.style.top = '0'
+
+  // 被系统打断（来电、音频焦点切换、耳机插拔）后自动续播
+  el.addEventListener('pause', () => {
+    if (!listening || sinkSwapping) return
+    setTimeout(() => {
+      if (listening && !sinkSwapping && el.paused) el.play().catch(() => {})
+    }, 300)
+  })
+
+  document.body.appendChild(el)
+  sinkAudio = el
+  return el
+}
+
+function applyMediaSession() {
+  if (!('mediaSession' in navigator)) return
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: '系统音频推流',
+      artist: 'Toneferry',
+      album: 'Loopback',
+    })
+    navigator.mediaSession.playbackState = 'playing'
+    navigator.mediaSession.setActionHandler('play', () => {
+      if (!listening) start().catch(console.error)
+      else if (sinkAudio && sinkAudio.paused) sinkAudio.play().catch(() => {})
+    })
+    navigator.mediaSession.setActionHandler('pause', () => {
+      stop().catch(console.error)
+    })
+    navigator.mediaSession.setActionHandler('stop', () => {
+      stop().catch(console.error)
+    })
+  } catch {
+    /* 部分浏览器不支持某些 action，忽略 */
   }
 }
 
-function stopKeepAliveMedia() {
-  if (keepAliveAudio) {
-    keepAliveAudio.pause()
-    keepAliveAudio.currentTime = 0
+/** 必须在用户手势内调用：先让媒体元素真正播放起来。 */
+async function primeMediaElement() {
+  const el = getSinkAudio()
+  if (!el.srcObject && !el.getAttribute('src')) {
+    el.src = silentWavDataUri(2, 8000)
+    el.loop = true
+  }
+  if (el.paused) {
+    try {
+      await el.play()
+    } catch (err) {
+      console.warn('[media] prime play failed', err)
+    }
+  }
+  applyMediaSession()
+}
+
+/** 把 AudioContext 的输出流接到媒体元素上；失败则回退到直接输出。 */
+async function attachSinkStream(stream) {
+  const el = getSinkAudio()
+  sinkSwapping = true
+  try {
+    el.pause()
+  } catch {
+    /* ignore */
+  }
+  try {
+    el.removeAttribute('src')
+    el.loop = false
+    el.srcObject = stream
+  } catch (err) {
+    console.warn('[media] srcObject unsupported', err)
+    sinkSwapping = false
+    return false
+  }
+  try {
+    await el.play()
+    usingSink = true
+    sinkSwapping = false
+    applyMediaSession()
+    return true
+  } catch (err) {
+    console.warn('[media] stream play failed', err)
+    sinkSwapping = false
+    return false
+  }
+}
+
+/** 媒体元素回退为静音 keep-alive（至少保住媒体会话，避免页面被冻结）。 */
+function fallbackKeepAlive() {
+  const el = getSinkAudio()
+  sinkSwapping = true
+  try {
+    el.pause()
+  } catch {
+    /* ignore */
+  }
+  try {
+    el.srcObject = null
+  } catch {
+    /* ignore */
+  }
+  el.src = silentWavDataUri(2, 8000)
+  el.loop = true
+  el.play()
+    .catch(() => {})
+    .finally(() => {
+      sinkSwapping = false
+    })
+  applyMediaSession()
+}
+
+function stopMediaElement() {
+  const el = sinkAudio
+  if (!el) return
+  try {
+    el.pause()
+  } catch {
+    /* ignore */
+  }
+  try {
+    el.srcObject = null
+  } catch {
+    /* ignore */
+  }
+  el.removeAttribute('src')
+  try {
+    el.load()
+  } catch {
+    /* ignore */
   }
   if ('mediaSession' in navigator) {
     try {
@@ -250,9 +306,12 @@ function stopKeepAliveMedia() {
   }
 }
 
-/** Keep the phone screen on. Must run inside a user gesture (click). */
+/* ------------------------------------------------------------------ */
+/* 屏幕常亮（可选，默认关闭：锁屏播放不需要常亮）                       */
+/* ------------------------------------------------------------------ */
+
 function enableNoSleep() {
-  if (!noSleep) return
+  if (!noSleep || !KEEP_SCREEN_ON) return
   try {
     const result = noSleep.enable()
     if (result && typeof result.catch === 'function') {
@@ -272,12 +331,27 @@ function disableNoSleep() {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 播放器                                                              */
+/* ------------------------------------------------------------------ */
+
+function resetPlayerBuffer() {
+  if (playerMode === 'worklet' && player) {
+    try {
+      player.port.postMessage({ type: 'reset' })
+    } catch {
+      /* ignore */
+    }
+  }
+  scriptQueue.clear()
+  bufferedEl.textContent = '0'
+  levelEl.style.width = '0%'
+}
+
 function destroyPlayer() {
   if (player) {
+    resetPlayerBuffer()
     try {
-      if (playerMode === 'worklet') {
-        player.port.postMessage({ type: 'reset' })
-      }
       player.disconnect()
     } catch {
       /* ignore */
@@ -294,46 +368,97 @@ async function ensurePlayer(sampleRate) {
     return
   }
 
-  destroyPlayer()
-  if (audioContext) {
+  // 服务端可能连续下发 audio-config，初始化必须串行，否则两个 AudioContext 会互相覆盖
+  if (initPromise) {
     try {
-      await audioContext.close()
+      await initPromise
+    } catch {
+      /* 上一轮失败，下面重试 */
+    }
+    if (audioContext && player && Math.abs(audioContext.sampleRate - sampleRate) < 1) {
+      if (audioContext.state === 'suspended') await audioContext.resume()
+      return
+    }
+  }
+
+  initPromise = createPlayer(sampleRate).finally(() => {
+    initPromise = null
+  })
+  return initPromise
+}
+
+async function createPlayer(sampleRate) {
+  destroyPlayer()
+  usingSink = false
+  sinkNode = null
+  const prev = audioContext
+  audioContext = null
+  if (prev) {
+    try {
+      await prev.close()
     } catch {
       /* ignore */
     }
-    audioContext = null
   }
 
-  audioContext = new AudioContext({ sampleRate })
-  const actualRate = audioContext.sampleRate
+  // 全程使用局部 ctx：await 期间全局可能被替换
+  const ctx = new AudioContext({ sampleRate })
+  audioContext = ctx
+  const actualRate = ctx.sampleRate
   if (Math.abs(actualRate - sampleRate) > 1) {
     console.warn(`AudioContext sampleRate=${actualRate}, stream=${sampleRate}`)
   }
 
+  // 被系统挂起时自动拉起（锁屏/切换音频焦点后常见）
+  ctx.addEventListener('statechange', () => {
+    if (!listening) return
+    if (ctx.state !== 'running') ctx.resume().catch(() => {})
+  })
+
+  // 优先走媒体元素通道，这是锁屏后仍能出声的前提
+  let outTarget = ctx.destination
+  let sink = null
+  if (typeof ctx.createMediaStreamDestination === 'function') {
+    try {
+      const node = ctx.createMediaStreamDestination()
+      if (await attachSinkStream(node.stream)) {
+        sink = node
+        outTarget = node
+      } else {
+        fallbackKeepAlive()
+      }
+    } catch (err) {
+      console.warn('[media] createMediaStreamDestination failed', err)
+      fallbackKeepAlive()
+    }
+  } else {
+    fallbackKeepAlive()
+  }
+
   const canWorklet =
-    window.isSecureContext && typeof audioContext.audioWorklet?.addModule === 'function'
+    window.isSecureContext && typeof ctx.audioWorklet?.addModule === 'function'
 
   if (canWorklet) {
     try {
-      await audioContext.audioWorklet.addModule('./audio-player.js')
-      const node = new AudioWorkletNode(audioContext, 'audio-player', {
+      await ctx.audioWorklet.addModule('./audio-player.js')
+      if (audioContext !== ctx) return
+      const node = new AudioWorkletNode(ctx, 'audio-player', {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [2],
       })
-      node.connect(audioContext.destination)
+      node.connect(outTarget)
       node.port.onmessage = (ev) => {
         const msg = ev.data
         if (msg?.type === 'stats') {
-          if (powerSave) return
           bufferedEl.textContent = String(msg.bufferedFrames)
           levelEl.style.width = `${Math.min(100, Math.round((msg.level || 0) * 140))}%`
         }
       }
+      sinkNode = sink
       player = node
       playerMode = 'worklet'
-      if (powerSave) setStatsEnabled(false)
-      if (audioContext.state === 'suspended') await audioContext.resume()
+      if (ctx.state === 'suspended') await ctx.resume()
       return
     } catch (err) {
       console.warn('AudioWorklet failed, fallback to ScriptProcessor', err)
@@ -341,19 +466,14 @@ async function ensurePlayer(sampleRate) {
     }
   }
 
+  if (audioContext !== ctx) return
+
   const bufferSize = 2048
-  const sp = audioContext.createScriptProcessor(bufferSize, 0, 2)
+  const sp = ctx.createScriptProcessor(bufferSize, 0, 2)
   sp.onaudioprocess = (ev) => {
     const outL = ev.outputBuffer.getChannelData(0)
     const outR = ev.outputBuffer.getChannelData(1)
     const interleaved = scriptQueue.pull(bufferSize)
-    if (powerSave) {
-      for (let i = 0; i < bufferSize; i++) {
-        outL[i] = interleaved[i * 2] || 0
-        outR[i] = interleaved[i * 2 + 1] || 0
-      }
-      return
-    }
     let peak = 0
     for (let i = 0; i < bufferSize; i++) {
       const l = interleaved[i * 2] || 0
@@ -366,17 +486,24 @@ async function ensurePlayer(sampleRate) {
     bufferedEl.textContent = String(scriptQueue.frames())
     levelEl.style.width = `${Math.min(100, Math.round(peak * 140))}%`
   }
-  const silent = audioContext.createGain()
-  silent.gain.value = 0
-  silent.connect(sp)
-  sp.connect(audioContext.destination)
+  if (!sink) {
+    // 仅直连扬声器时需要这个 0 增益节点，避免 ScriptProcessor 被回收
+    const silent = ctx.createGain()
+    silent.gain.value = 0
+    silent.connect(sp)
+  }
+  sp.connect(outTarget)
+  sinkNode = sink
   player = sp
   playerMode = 'script'
 
-  if (audioContext.state === 'suspended') await audioContext.resume()
+  if (ctx.state === 'suspended') await ctx.resume()
 }
 
 function feedPcm(arrayBuffer) {
+  // 手机 App 在播时网页端必须完全静音：一旦送进播放器就会外放，
+  // 电脑的 WASAPI loopback 会把外放声再采一遍推回手机 → 手机上听到两份。
+  if (!audioEnabled) return
   if (!player) return
   if (playerMode === 'worklet') {
     player.port.postMessage(arrayBuffer, [arrayBuffer])
@@ -388,6 +515,9 @@ function feedPcm(arrayBuffer) {
 }
 
 async function applyAudioConfig(msg) {
+  // 被手机 App 接管期间只当「在线监测连接」用，不建播放图。
+  // 一旦建了 AudioContext / 媒体元素，声音就会从电脑扬声器出来被 loopback 采回去。
+  if (!audioEnabled) return
   config = {
     sampleRate: Number(msg.sampleRate) || 48000,
     channels: Number(msg.channels) || 2,
@@ -405,45 +535,23 @@ async function applyAudioConfig(msg) {
   }
 }
 
-/** Resume after returning to the page — reconnect WS if it was paused or dropped. */
-async function resumePlayback() {
-  if (!listening) return
-  if (document.hidden) return
+/* ------------------------------------------------------------------ */
+/* WebSocket                                                           */
+/* ------------------------------------------------------------------ */
 
-  const wasPaused = backgroundPaused
-  backgroundPaused = false
-  clearReconnect()
-  bumpIdle()
-
-  enableNoSleep()
-  await startKeepAliveMedia()
-
-  if (audioContext && audioContext.state === 'suspended') {
-    try {
-      await audioContext.resume()
-    } catch (err) {
-      console.warn('AudioContext.resume failed', err)
-    }
-  }
-
-  const needWs =
-    wasPaused || !ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED
-
-  if (needWs) {
-    reconnectAttempt = 0
-    setStatus('回到前台，正在重连…', true)
+function scheduleReconnect() {
+  // 锁屏/后台同样要重连：不再因为 document.hidden 而放弃。
+  // 另外：手机 App 在线时即使本机没在收听也要保持一条监测连接，
+  // 否则收不到「手机已断开」的通知，按钮会一直锁死。
+  if ((!listening && nativePeerCount === 0) || reconnectTimer) return
+  const delay = Math.min(8000, 500 * 2 ** reconnectAttempt)
+  reconnectAttempt += 1
+  setStatus(`连接断开，${Math.round(delay / 1000)}s 后重连…`)
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    if (!listening && nativePeerCount === 0) return
     connectWs()
-    return
-  }
-
-  if (ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(JSON.stringify({ type: 'get-config' }))
-    } catch {
-      /* ignore */
-    }
-    if (config && player) setStatus(playingLabel(), true)
-  }
+  }, delay)
 }
 
 function connectWs() {
@@ -467,8 +575,19 @@ function connectWs() {
 
   ws.onopen = () => {
     reconnectAttempt = 0
+    // 重连后丢弃旧缓冲，避免回放上一段陈旧音频
+    resetPlayerBuffer()
     setStatus(config ? playingLabel() : '已连接，等待音频配置…', true)
-    ws.send(JSON.stringify({ type: 'get-config' }))
+    try {
+      // 先声明要不要收 PCM：被手机顶掉时这里为 false，
+      // 服务端就不会再往下行灌数据，链路彻底干净。
+      ws.send(JSON.stringify({ type: 'wants-audio', value: audioEnabled }))
+      // 重连后必须重新开闸，否则手机端会一直安静
+      if (listening) ws.send(JSON.stringify({ type: 'start-stream' }))
+      ws.send(JSON.stringify({ type: 'get-config' }))
+    } catch {
+      /* ignore */
+    }
   }
 
   ws.onmessage = (event) => {
@@ -481,6 +600,17 @@ function connectWs() {
       }
       if (msg.type === 'audio-config') {
         applyAudioConfig(msg)
+      } else if (msg.type === 'peer-mode') {
+        applyPeerMode(Number(msg.nativeCount) || 0)
+      } else if (msg.type === 'stream-state') {
+        // 只处理「确认开闸之后又被关掉」的情况（另一个标签页点了停止）。
+        // 刚连上时服务端会先发一次 enabled:false，那是初始态，不能当成停止。
+        if (msg.enabled) {
+          streamConfirmed = true
+        } else if (streamConfirmed && listening) {
+          streamConfirmed = false
+          softStop('推流已被停止')
+        }
       } else if (msg.type === 'error') {
         setStatus(`错误：${msg.message}`)
       } else if (msg.type === 'status') {
@@ -496,11 +626,7 @@ function connectWs() {
 
   ws.onclose = () => {
     ws = null
-    if (backgroundPaused || document.hidden) {
-      // Closed because page went to background — wait for foreground
-      return
-    }
-    if (listening) {
+    if (listening || nativePeerCount > 0) {
       scheduleReconnect()
     } else {
       setStatus('连接已断开')
@@ -514,40 +640,151 @@ function connectWs() {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 自愈 watchdog                                                       */
+/* ------------------------------------------------------------------ */
+
+function startWatchdog() {
+  stopWatchdog()
+  heartbeatTick = 0
+  watchdogTimer = setInterval(() => {
+    if (!listening) return
+
+    // 心跳与重连跟「本机是否出声」无关：手机在线时本机静音，
+    // 但 socket 必须活着，否则收不到「手机已断开」，总闸就没法恢复。
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      if (!reconnectTimer) connectWs()
+      return
+    }
+
+    heartbeatTick += 1
+    if (ws.readyState === WebSocket.OPEN && heartbeatTick * WATCHDOG_MS >= HEARTBEAT_MS) {
+      heartbeatTick = 0
+      try {
+        ws.send(JSON.stringify({ type: 'ping' }))
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // 本机静音期间没有播放图，下面这些自愈动作没意义
+    if (!audioEnabled) return
+
+    if (audioContext && audioContext.state !== 'running') {
+      audioContext.resume().catch(() => {})
+    }
+    if (sinkAudio && sinkAudio.paused) {
+      sinkAudio.play().catch(() => {})
+    }
+  }, WATCHDOG_MS)
+}
+
+function stopWatchdog() {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer)
+    watchdogTimer = null
+  }
+  heartbeatTick = 0
+}
+
+/** 回到前台时补齐状态；锁屏期间播放不会中断。 */
+async function resumePlayback() {
+  if (!listening) return
+
+  if (audioContext && audioContext.state === 'suspended') {
+    try {
+      await audioContext.resume()
+    } catch (err) {
+      console.warn('AudioContext.resume failed', err)
+    }
+  }
+  if (sinkAudio && sinkAudio.paused) {
+    try {
+      await sinkAudio.play()
+    } catch (err) {
+      console.warn('[media] resume failed', err)
+    }
+  }
+
+  const needWs = !ws || ws.readyState !== WebSocket.OPEN
+  if (needWs) {
+    reconnectAttempt = 0
+    if (!reconnectTimer) {
+      setStatus('正在重连…', true)
+      connectWs()
+    }
+    return
+  }
+
+  if (config && player) setStatus(playingLabel(), true)
+}
+
+/* ------------------------------------------------------------------ */
+/* 启停                                                                */
+/* ------------------------------------------------------------------ */
+
 async function start() {
   listening = true
-  backgroundPaused = false
+  // 手机 App 在线时本机不发声（否则外放被 loopback 采回去 → 手机听到回声）
+  audioEnabled = nativePeerCount === 0
+  streamConfirmed = false
   btnStart.disabled = true
   btnStop.disabled = false
   config = null
   reconnectAttempt = 0
   clearReconnect()
-  exitPowerSave()
-  schedulePowerSave()
-  enableNoSleep()
 
+  // 用户手势内解锁音频 & 让媒体元素真正播放起来
   const unlock = new AudioContext()
   if (unlock.state === 'suspended') await unlock.resume()
   await unlock.close()
 
-  await startKeepAliveMedia()
+  if (audioEnabled) await primeMediaElement()
+  if (KEEP_SCREEN_ON) enableNoSleep()
+
+  startWatchdog()
   connectWs()
+}
+
+/** 只回到停止态、不动 socket（用于被服务端/其它标签页关闸的情况） */
+function softStop(reason) {
+  listening = false
+  audioEnabled = false
+  stopWatchdog()
+  disableNoSleep()
+  destroyPlayer()
+  if (audioContext) {
+    audioContext.close().catch(() => {})
+    audioContext = null
+  }
+  stopMediaElement()
+  config = null
+  btnStart.disabled = false
+  btnStop.disabled = true
+  bufferedEl.textContent = '0'
+  levelEl.style.width = '0%'
+  setStatus(reason || '已停止')
 }
 
 async function stop() {
   listening = false
-  backgroundPaused = false
+  audioEnabled = false
   clearReconnect()
-  clearPowerSaveTimer()
-  exitPowerSave()
+  stopWatchdog()
   reconnectAttempt = 0
   btnStart.disabled = false
   btnStop.disabled = true
 
   disableNoSleep()
-  stopKeepAliveMedia()
 
   if (ws) {
+    // 先关闸再断开：服务端只有收到 stop-stream 才会停止下发，
+    // 否则要等 close 事件里的 owner 清理，中间会多推几十毫秒
+    try {
+      ws.send(JSON.stringify({ type: 'stop-stream' }))
+    } catch {
+      /* ignore */
+    }
     ws.onclose = null
     try {
       ws.close()
@@ -555,6 +792,46 @@ async function stop() {
       /* ignore */
     }
     ws = null
+  }
+  streamConfirmed = false
+  destroyPlayer()
+  if (audioContext) {
+    try {
+      await audioContext.close()
+    } catch {
+      /* ignore */
+    }
+    audioContext = null
+  }
+  stopMediaElement()
+  config = null
+  setStatus('已停止')
+  bufferedEl.textContent = '0'
+  levelEl.style.width = '0%'
+}
+
+/* ------------------------------------------------------------------ */
+/* 手机 App 接管                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 手机 App 在线时把**本机**静音，但不动总开关。
+ * 网页外放的声音会被电脑的 WASAPI loopback 重新采进去，再推回手机播一遍，
+ * 手机听到的就是「原声 + 延迟副本」——这是物理闭环，只能在源头掐断。
+ *
+ * 这里绝不能调用完整的 stop()：那会关掉总闸，手机也跟着没声了；
+ * 也不能只关 socket：断了就收不到「手机已断开」的通知，「开始收听」会永久卡住。
+ * 正确做法是只掐本机音频通道（audioEnabled=false + wants-audio:false），保留 socket。
+ */
+async function muteLocalAudio() {
+  audioEnabled = false
+  // 注意：不 stopWatchdog()。总闸还开着，socket 与心跳必须继续跑，
+  // 否则手机断开时收不到通知，界面会一直停在「已接管」。
+  disableNoSleep()
+  try {
+    ws?.send(JSON.stringify({ type: 'wants-audio', value: false }))
+  } catch {
+    /* ignore */
   }
   destroyPlayer()
   if (audioContext) {
@@ -565,54 +842,81 @@ async function stop() {
     }
     audioContext = null
   }
+  stopMediaElement()
   config = null
-  setStatus('已停止')
   bufferedEl.textContent = '0'
   levelEl.style.width = '0%'
 }
 
+/** 手机走了，本机恢复出声（前提是总闸还开着） */
+function resumeLocalAudio() {
+  audioEnabled = true
+  try {
+    ws?.send(JSON.stringify({ type: 'wants-audio', value: true }))
+  } catch {
+    /* ignore */
+  }
+  resetPlayerBuffer()
+  startWatchdog()
+  try {
+    ws?.send(JSON.stringify({ type: 'get-config' }))
+  } catch {
+    /* ignore */
+  }
+}
+
+function applyPeerMode(count) {
+  const prev = nativePeerCount
+  nativePeerCount = count
+
+  if (count > 0) {
+    if (prev === 0) {
+      muteLocalAudio()
+      setStatus(
+        listening
+          ? '手机 App 已接管，本机已静音（避免回声）'
+          : '手机 App 在线，点「开始收听」后手机开始播放',
+      )
+    }
+  } else if (prev > 0) {
+    if (listening) {
+      resumeLocalAudio()
+      setStatus('手机 App 已断开，恢复本机播放')
+    } else {
+      setStatus('手机 App 已断开')
+    }
+  }
+
+  // 总开关与停止按钮的可用性只取决于 listening，跟手机在不在线无关。
+  // 旧逻辑在手机上线时把两个按钮一起 disable，导致「点了开始却停不下来」。
+  btnStart.disabled = listening
+  btnStop.disabled = !listening
+}
+
 btnStart.addEventListener('click', () => {
-  enableNoSleep()
   start().catch((err) => {
     console.error(err)
     setStatus(String(err.message || err))
     listening = false
-    clearPowerSaveTimer()
-    exitPowerSave()
+    stopWatchdog()
     disableNoSleep()
     btnStart.disabled = false
     btnStop.disabled = true
   })
 })
+
 btnStop.addEventListener('click', () => {
   stop().catch(console.error)
 })
 
-window.addEventListener(
-  'pointerdown',
-  () => {
-    if (listening) bumpIdle()
-  },
-  { passive: true },
-)
-window.addEventListener(
-  'keydown',
-  () => {
-    if (listening) bumpIdle()
-  },
-  { passive: true },
-)
-
+/* 页面不可见（含锁屏）不再暂停播放，只做状态提示。 */
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') {
-    pauseForBackground()
-  } else {
+  if (!listening) return
+  if (document.visibilityState === 'visible') {
     resumePlayback().catch(console.error)
+  } else if (config && player) {
+    setStatus(playingLabel(), true)
   }
-})
-
-window.addEventListener('pagehide', () => {
-  pauseForBackground()
 })
 
 window.addEventListener('pageshow', (ev) => {
@@ -627,7 +931,38 @@ window.addEventListener('focus', () => {
   }
 })
 
-// Some mobiles fire this when unlocking screen while page stays "visible"
+// 部分移动端解锁屏幕时触发
 document.addEventListener('resume', () => {
   resumePlayback().catch(console.error)
 })
+
+// 熄屏/后台后浏览器可能回收定时器，回到前台立即自检一次
+window.addEventListener('online', () => {
+  if (listening) resumePlayback().catch(console.error)
+})
+
+/**
+ * 排障用状态快照。手机端可在地址栏执行（需在页面上下文）：
+ *   __toneferry.state
+ * 或在电脑 Chrome 远程调试里查看。锁屏无声时先看 sinkHasStream / audioContext。
+ */
+window.__toneferry = {
+  get state() {
+    return {
+      listening,
+      wsState: ws ? ws.readyState : null,
+      audioContext: audioContext ? audioContext.state : null,
+      playerMode,
+      usingSink,
+      sinkPaused: sinkAudio ? sinkAudio.paused : null,
+      sinkHasStream: !!(sinkAudio && sinkAudio.srcObject),
+      buffered: bufferedEl.textContent,
+      status: statusText.textContent,
+    }
+  },
+  async probe() {
+    if (sinkAudio && sinkAudio.paused) await sinkAudio.play().catch(() => {})
+    if (audioContext && audioContext.state !== 'running') await audioContext.resume().catch(() => {})
+    return this.state
+  },
+}
