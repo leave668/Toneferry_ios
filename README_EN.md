@@ -17,6 +17,54 @@ Whatever the PC is playing, your phone hears it. No "Stereo Mix" device needed.
 
 ---
 
+## One single file
+
+The Windows release is exactly one file: `release/Toneferry.exe`. Double-click and go.
+
+- No Node.js, no .NET, no VC++ redistributable required
+- No DLL folder to keep beside it, no console window
+- Bundles the HTTP/WebSocket server, the web UI, the WASAPI capture engine, the audio player and the tray icon
+
+On launch it self-extracts its inner parts into `%LOCALAPPDATA%\Toneferry\` (`ToneferryServer.exe`, logs, recent-peer records). That is normal self-extraction behaviour and does not change the "ship one exe" story.
+
+---
+
+## Can't open it on someone else's machine?
+
+### Toneferry.exe
+
+The binary is self-contained. What blocks it on another PC is almost always Windows security, not a broken build:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "Windows protected your PC", only a "Don't run" button | File was downloaded via a browser/IM, so it carries Mark-of-the-Web, and it is not code-signed | Click "More info" → "Run anyway", or run `Unblock-File .\Toneferry.exe` |
+| Double-click does nothing, no tray icon | Defender / 360 / Huorong deleted or quarantined the extracted `ToneferryServer.exe` | Whitelist both `Toneferry.exe` and `%LOCALAPPDATA%\Toneferry`, then relaunch |
+| Missing `VCRUNTIME140.dll` or similar | OS too old; Toneferry needs **64-bit Windows 10 1809+ / 11** | Upgrade the OS; 32-bit and ARM64 are not supported |
+| Browser opens a blank page / cannot connect | Port 3088 already taken | Since v1.7.2 it auto-picks the next free port; the tray menu's first line shows the real address |
+| Tray icon appears, phone cannot connect | Firewall blocks inbound | Allow "Private network" on first run |
+
+**Self-diagnosis** when it won't open:
+
+```
+Toneferry.exe --diagnose
+```
+
+Writes `%LOCALAPPDATA%\Toneferry\diagnose.txt` (OS version, port state, extracted files, recent logs) and opens it. Send that file to whoever is debugging.
+
+### Toneferry-ios.ipa
+
+**The IPA is unsigned.** iOS refuses to install unsigned apps — this is Apple's policy, not a corrupt file.
+
+| Install method | Requirement |
+| --- | --- |
+| TrollStore | TrollStore already installed on the device; just tap the IPA |
+| AltStore / Sideloadly | Re-sign with **your own** Apple ID; free accounts expire in 7 days and allow max 3 apps |
+| Developer / enterprise certificate | Re-sign with `codesign` using your own certificate |
+
+Also: the client requires **iOS 15.0+, arm64 (iPhone)** — `UIDeviceFamily` declares iPhone only.
+
+---
+
 ## System tray (no cmd window)
 
 `Toneferry.exe` is a GUI-subsystem tray host. Double-clicking it **does not pop up a black console window**; it goes straight to the system tray.
@@ -82,8 +130,10 @@ Default URL: http://<LAN-IP>:3088
 ## Build
 
 ```bash
-npm run build   # → release/Toneferry.exe
+npm run build   # → release/Toneferry.exe (single file, ~64 MB)
 ```
+
+One artifact only: the server (pkg), web UI, capture engine, player and icon are all embedded and self-extract to `%LOCALAPPDATA%\Toneferry\` at runtime.
 
 ---
 

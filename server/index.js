@@ -9,6 +9,12 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { createPeerStore } from './peers.js'
 import { createMicChannel, resolvePlayerPath, MIC_CHANNEL_ID, MIC_SAMPLE_RATE } from './mic.js'
 
+/**
+ * 服务端版本。pkg 打包成单文件后读不到 package.json，这里必须硬编码。
+ * 升级时同步改 package.json / package-lock.json / ios/Info.plist 与本行。
+ */
+const VERSION = '1.7.2'
+
 /** Prefer LAN IPv4 (e.g. 192.168.x.x) for phone access on the same Wi‑Fi. */
 function getLanIPv4() {
   const ifaces = os.networkInterfaces()
@@ -409,6 +415,7 @@ function statusSnapshot() {
   const host = getLanIPv4()
   return {
     ok: true,
+    version: VERSION,
     host,
     port: HTTP_PORT,
     url: `http://${host}:${HTTP_PORT}`,

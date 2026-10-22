@@ -1,10 +1,10 @@
 // Toneferry.exe —— 托盘宿主。
 //
 // 职责：
-//   1. 以 GUI 子系统启动（双击不弹 cmd 黑框）
-//   2. 把内嵌的 ToneferryServer.exe 释放到 %LOCALAPPDATA%\Toneferry\ 并隐藏启动
-//   3. 托盘图标 + 右键菜单（开始/停止推送、授权手机麦克风、最近连接、打开网页、退出）
-//   4. 手机请求麦克风时弹气泡提醒，等用户点「授权」
+//  1. 以 GUI 子系统启动（双击不弹 cmd 黑框）
+//  2. 把内嵌的 ToneferryServer.exe 释放到 %LOCALAPPDATA%\Toneferry\ 并隐藏启动
+//  3. 托盘图标 + 右键菜单（开始/停止推送、授权手机麦克风、最近连接、打开网页、退出）
+//  4. 手机请求麦克风时弹气泡提醒，等用户点「授权」
 //
 // 与服务端之间只走本地 HTTP（/api/status、/api/control），不共享内存，互不影响。
 package main
@@ -17,11 +17,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -73,7 +76,7 @@ const (
 	// 一定失败 —— 表现就是「程序在跑，但右下角没有图标」。
 	wsPopup = 0x80000000
 
-	imageIcon     = 1
+	imageIcon      = 1
 	lrLoadFromFile = 0x00000010
 
 	createNoWindow = 0x08000000
@@ -110,15 +113,16 @@ type peerInfo struct {
 }
 
 type serverStatus struct {
-	OK             bool      `json:"ok"`
-	Host           string    `json:"host"`
-	Port           int       `json:"port"`
-	URL            string    `json:"url"`
-	StreamEnabled  bool      `json:"streamEnabled"`
-	CaptureRunning bool      `json:"captureRunning"`
-	Mic            micState  `json:"mic"`
-	NativeCount    int       `json:"nativeCount"`
-	Clients        int       `json:"clients"`
+	OK             bool       `json:"ok"`
+	Version        string     `json:"version"`
+	Host           string     `json:"host"`
+	Port           int        `json:"port"`
+	URL            string     `json:"url"`
+	StreamEnabled  bool       `json:"streamEnabled"`
+	CaptureRunning bool       `json:"captureRunning"`
+	Mic            micState   `json:"mic"`
+	NativeCount    int        `json:"nativeCount"`
+	Clients        int        `json:"clients"`
 	Peers          []peerInfo `json:"peers"`
 }
 
@@ -155,42 +159,48 @@ var (
 	shell32  = syscall.NewLazyDLL("shell32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	pRegisterClassExW  = user32.NewProc("RegisterClassExW")
-	pCreateWindowExW   = user32.NewProc("CreateWindowExW")
-	pDefWindowProcW    = user32.NewProc("DefWindowProcW")
-	pGetMessageW       = user32.NewProc("GetMessageW")
-	pTranslateMessage  = user32.NewProc("TranslateMessage")
-	pDispatchMessageW  = user32.NewProc("DispatchMessageW")
-	pPostMessageW      = user32.NewProc("PostMessageW")
-	pCreatePopupMenu   = user32.NewProc("CreatePopupMenu")
-	pAppendMenuW       = user32.NewProc("AppendMenuW")
-	pTrackPopupMenu    = user32.NewProc("TrackPopupMenu")
-	pDestroyMenu       = user32.NewProc("DestroyMenu")
-	pSetForegroundWnd  = user32.NewProc("SetForegroundWindow")
-	pGetCursorPos      = user32.NewProc("GetCursorPos")
-	pDestroyIcon       = user32.NewProc("DestroyIcon")
-	pLoadIconW         = user32.NewProc("LoadIconW")
-	pShellNotifyIconW  = shell32.NewProc("Shell_NotifyIconW")
-	pExtractIconExW    = shell32.NewProc("ExtractIconExW")
-	pLoadImageW        = user32.NewProc("LoadImageW")
-	pShellExecuteW     = shell32.NewProc("ShellExecuteW")
-	pCreateMutexW      = kernel32.NewProc("CreateMutexW")
+	pRegisterClassExW = user32.NewProc("RegisterClassExW")
+	pCreateWindowExW  = user32.NewProc("CreateWindowExW")
+	pDefWindowProcW   = user32.NewProc("DefWindowProcW")
+	pGetMessageW      = user32.NewProc("GetMessageW")
+	pTranslateMessage = user32.NewProc("TranslateMessage")
+	pDispatchMessageW = user32.NewProc("DispatchMessageW")
+	pPostMessageW     = user32.NewProc("PostMessageW")
+	pCreatePopupMenu  = user32.NewProc("CreatePopupMenu")
+	pAppendMenuW      = user32.NewProc("AppendMenuW")
+	pTrackPopupMenu   = user32.NewProc("TrackPopupMenu")
+	pDestroyMenu      = user32.NewProc("DestroyMenu")
+	pSetForegroundWnd = user32.NewProc("SetForegroundWindow")
+	pGetCursorPos     = user32.NewProc("GetCursorPos")
+	pDestroyIcon      = user32.NewProc("DestroyIcon")
+	pLoadIconW        = user32.NewProc("LoadIconW")
+	pShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
+	pExtractIconExW   = shell32.NewProc("ExtractIconExW")
+	pLoadImageW       = user32.NewProc("LoadImageW")
+	pShellExecuteW    = shell32.NewProc("ShellExecuteW")
+	pCreateMutexW     = kernel32.NewProc("CreateMutexW")
 )
 
 var (
-	mu       sync.Mutex
-	status   *serverStatus
-	lastErr  string
-	serverExe string
-	childCmd  *exec.Cmd
-	hIcon     uintptr
-	hwndMain  uintptr
-	port      = 3088
+	mu          sync.Mutex
+	status      *serverStatus
+	lastErr     string
+	serverExe   string
+	childCmd    *exec.Cmd
+	hIcon       uintptr
+	hwndMain    uintptr
+	port        = 3088
+	dataRoot    string
 	micPrompted bool
 )
 
 func main() {
 	runtime.LockOSThread()
+
+	if len(os.Args) > 1 && (os.Args[1] == "--diagnose" || os.Args[1] == "/diagnose") {
+		runDiagnose()
+		return
+	}
 
 	if !ensureSingleInstance() {
 		return
@@ -198,27 +208,61 @@ func main() {
 
 	dir, err := dataDir()
 	if err != nil {
-		messageBox("Toneferry 启动失败", "无法创建数据目录："+err.Error())
+		messageBox("Toneferry 启动失败",
+			"无法创建数据目录，程序没有可写的磁盘位置。\r\n\r\n"+
+				"常见原因：\r\n"+
+				"  1. 程序被放在只读目录（如光盘、受保护的系统盘根目录）\r\n"+
+				"  2. 安全软件拦截了写入\r\n\r\n"+
+				"请把 Toneferry.exe 移到桌面或 D 盘后重试。\r\n错误："+err.Error())
 		return
 	}
 
+	preferred := 3088
 	if p := os.Getenv("PORT"); p != "" {
-		fmt.Sscanf(p, "%d", &port)
+		fmt.Sscanf(p, "%d", &preferred)
+	}
+	port = pickPort(preferred)
+	if port != preferred {
+		hostLog("端口 %d 被占用，改用 %d", preferred, port)
 	}
 
 	serverExe, err = extractServer(dir)
 	if err != nil {
-		messageBox("Toneferry 启动失败", "释放服务端失败："+err.Error())
+		messageBox("Toneferry 启动失败",
+			"释放内置服务端失败：\r\n"+err.Error()+"\r\n\r\n"+
+				"这通常是杀毒软件 / Windows Defender 拦截了程序写出文件造成的。\r\n"+
+				"请把 Toneferry.exe 加入安全软件白名单，或点「更多信息 → 仍要运行」后重试。\r\n\r\n"+
+				"日志："+filepath.Join(dir, "host.log"))
 		return
 	}
 
 	icoPath := extractIcon(dir)
 	hIcon = loadIcon(serverExe, icoPath)
-	hostLog("启动：ico=%q hIcon=%d", icoPath, hIcon)
+	hostLog("启动：dir=%q ico=%q hIcon=%d port=%d", dir, icoPath, hIcon, port)
 
 	if err := startServer(); err != nil {
-		messageBox("Toneferry 启动失败", "服务端启动失败："+err.Error())
+		messageBox("Toneferry 启动失败",
+			"内置服务端无法启动：\r\n"+err.Error()+"\r\n\r\n"+
+				"请把 Toneferry.exe 加入杀毒软件白名单后重试。\r\n"+
+				"日志："+filepath.Join(dir, "toneferry.log"))
 		return
+	}
+
+	// 子进程「启动成功」不等于「能服务」：杀软可能在 CreateProcess 之后立刻
+	// 把 exe 删掉，或者服务端因为别的原因秒退。这里必须真正探活一次，
+	// 否则用户看到的就是「双击了，什么都没发生」。
+	if !waitServerReady(15 * time.Second) {
+		tail := logTail(filepath.Join(dir, "toneferry.log"), 1800)
+		if tail == "" {
+			tail = "（日志为空，服务端可能被杀毒软件直接拦截，未能执行）"
+		}
+		messageBox("Toneferry 服务未就绪",
+			fmt.Sprintf("内置服务端在 15 秒内没有响应 http://127.0.0.1:%d/ 。\r\n\r\n"+
+				"请依次尝试：\r\n"+
+				"  1. 把 Toneferry.exe 与 %%LOCALAPPDATA%%\\Toneferry 加入杀毒软件白名单\r\n"+
+				"  2. 右键 Toneferry.exe → 属性 → 勾选「解除锁定」\r\n"+
+				"  3. 用管理员身份运行一次\r\n\r\n"+
+				"最近日志：\r\n%s", port, tail))
 	}
 
 	createTrayWindow()
@@ -233,14 +277,183 @@ func main() {
 	messageLoop()
 }
 
-func dataDir() (string, error) {
-	base := os.Getenv("LOCALAPPDATA")
-	if base == "" {
-		home, _ := os.UserHomeDir()
-		base = filepath.Join(home, "AppData", "Local")
+/* ------------------------------ 环境探测 ------------------------------ */
+
+// pickPort 从首选端口往后找一个真正能绑定的端口。
+// 3088 被别的程序占住时，服务端会 EADDRINUSE 秒退，表现就是「双击没反应」。
+func pickPort(preferred int) int {
+	for p := preferred; p < preferred+20; p++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err == nil {
+			ln.Close()
+			return p
+		}
 	}
-	dir := filepath.Join(base, appName)
-	return dir, os.MkdirAll(dir, 0o755)
+	return preferred
+}
+
+func waitServerReady(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := httpClient().Get(apiURL("/api/status"))
+		if err == nil {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return true
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// logTail 读文件末尾若干字节，用于把失败原因直接摆在用户面前。
+// 服务端日志带 ANSI 颜色码，落到报告里必须剥掉，否则是一堆乱码。
+var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]")
+
+func logTail(path string, max int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return ""
+	}
+	off := st.Size() - max
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, st.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return ""
+	}
+	return strings.TrimSpace(ansiRe.ReplaceAllString(string(buf), ""))
+}
+
+// runDiagnose 供「打不开」时自救：把本机环境写成一个报告文件再打开。
+func runDiagnose() {
+	dir, dirErr := dataDir()
+	if dirErr != nil {
+		dir = os.TempDir()
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Toneferry 诊断报告\r\n")
+	fmt.Fprintf(&b, "生成时间：%s\r\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "程序路径：%s\r\n", mustExecutable())
+	fmt.Fprintf(&b, "系统架构：%s/%s\r\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(&b, "Windows  ：%s\r\n", windowsVersion())
+	fmt.Fprintf(&b, "数据目录：%s（错误：%v）\r\n", dir, dirErr)
+	fmt.Fprintf(&b, "端口 3088：%s\r\n", portState(3088))
+	fmt.Fprintf(&b, "端口选择：%d\r\n", pickPort(3088))
+	fmt.Fprintf(&b, "\r\n--- 已释放的文件 ---\r\n")
+	for _, n := range []string{"ToneferryServer.exe", "audio-capture.exe", "audio-play.exe", "icon.ico"} {
+		p := filepath.Join(dir, n)
+		if _, err := os.Stat(p); err != nil {
+			// 采集器 / 播放器由服务端释放到 %TEMP%\toneferry-runtime
+			if alt := filepath.Join(os.TempDir(), "toneferry-runtime", n); fileExists(alt) {
+				p = alt
+			}
+		}
+		if st, err := os.Stat(p); err == nil {
+			fmt.Fprintf(&b, "%-22s %10d 字节  %s  %s\r\n", n, st.Size(), st.ModTime().Format("15:04:05"), p)
+		} else {
+			fmt.Fprintf(&b, "%-22s 缺失\r\n", n)
+		}
+	}
+	fmt.Fprintf(&b, "\r\n--- host.log ---\r\n%s\r\n", logTail(filepath.Join(dir, "host.log"), 4000))
+	fmt.Fprintf(&b, "\r\n--- toneferry.log ---\r\n%s\r\n", logTail(filepath.Join(dir, "toneferry.log"), 4000))
+
+	out := filepath.Join(dir, "diagnose.txt")
+	if err := os.WriteFile(out, []byte(b.String()), 0o644); err != nil {
+		messageBox("Toneferry 诊断", b.String())
+		return
+	}
+	hostLog("诊断报告已生成 %s", out)
+	verb, _ := syscall.UTF16PtrFromString("open")
+	target, _ := syscall.UTF16PtrFromString(out)
+	pShellExecuteW.Call(0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(target)), 0, 0, 1)
+}
+
+func mustExecutable() string {
+	p, err := os.Executable()
+	if err != nil {
+		return "（未知）"
+	}
+	return p
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.Size() > 0
+}
+
+func portState(p int) string {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+	if err != nil {
+		return "被占用 / 不可用（" + err.Error() + "）"
+	}
+	ln.Close()
+	return "空闲"
+}
+
+func windowsVersion() string {
+	type osvi struct {
+		Size       uint32
+		Major      uint32
+		Minor      uint32
+		Build      uint32
+		Platform   uint32
+		CSDVersion *uint16
+	}
+	v := osvi{Size: uint32(unsafe.Sizeof(osvi{}))}
+	ntdll := syscall.NewLazyDLL("ntdll.dll")
+	proc := ntdll.NewProc("RtlGetVersion")
+	if r, _, _ := proc.Call(uintptr(unsafe.Pointer(&v))); r == 0 {
+		return fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Build)
+	}
+	return "（未知）"
+}
+
+// dataDir 带多级降级：%LOCALAPPDATA% 不可写时退到 %APPDATA%、%TEMP%、exe 同级。
+// 只读环境（U 盘只读、受控目录）下仍然要能跑起来。
+func dataDir() (string, error) {
+	if dataRoot != "" {
+		return dataRoot, nil
+	}
+	var cands []string
+	if base := os.Getenv("LOCALAPPDATA"); base != "" {
+		cands = append(cands, filepath.Join(base, appName))
+	}
+	if base := os.Getenv("APPDATA"); base != "" {
+		cands = append(cands, filepath.Join(base, appName))
+	}
+	cands = append(cands, filepath.Join(os.TempDir(), appName))
+	if exe, err := os.Executable(); err == nil {
+		cands = append(cands, filepath.Join(filepath.Dir(exe), appName+"-data"))
+	}
+
+	var lastErr error
+	for _, d := range cands {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			lastErr = err
+			continue
+		}
+		probe := filepath.Join(d, ".write-test")
+		if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+			lastErr = err
+			continue
+		}
+		os.Remove(probe)
+		dataRoot = d
+		return d, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可用的可写目录")
+	}
+	return "", lastErr
 }
 
 func ensureSingleInstance() bool {
@@ -257,6 +470,7 @@ func ensureSingleInstance() bool {
 }
 
 // extractServer 把内嵌的服务端写到磁盘。pkg 的虚拟文件系统不能直接 CreateProcess。
+// 写盘是最容易被安全软件掐住的一步，所以这里做「校验 + 重试 + 换目录」三层兜底。
 func extractServer(dir string) (string, error) {
 	raw, err := assets.ReadFile("assets/ToneferryServer.exe")
 	if err != nil {
@@ -264,26 +478,67 @@ func extractServer(dir string) (string, error) {
 	}
 	sum := sha256.Sum256(raw)
 	want := hex.EncodeToString(sum[:8])
-	dest := filepath.Join(dir, "ToneferryServer.exe")
-	stamp := filepath.Join(dir, "server.sha")
 
-	if b, err := os.ReadFile(stamp); err == nil && string(bytes.TrimSpace(b)) == want {
-		if _, err := os.Stat(dest); err == nil {
+	// 换目录兜底：某些机器上安全软件只允许往 %TEMP% 写可执行文件
+	dirs := []string{dir}
+	for _, alt := range []string{filepath.Join(os.TempDir(), appName), filepath.Join(os.TempDir(), appName+"-rt")} {
+		if alt != dir {
+			dirs = append(dirs, alt)
+		}
+	}
+
+	var lastErr error
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			lastErr = err
+			continue
+		}
+		dest := filepath.Join(d, "ToneferryServer.exe")
+		stamp := filepath.Join(d, "server.sha")
+
+		if b, err := os.ReadFile(stamp); err == nil && string(bytes.TrimSpace(b)) == want {
+			if st, err := os.Stat(dest); err == nil && st.Size() == int64(len(raw)) {
+				dataRoot = d
+				return dest, nil
+			}
+		}
+
+		// 覆盖前先杀掉旧进程，否则文件被占用
+		killServerImage(dest)
+
+		for attempt := 1; attempt <= 3; attempt++ {
+			tmp := fmt.Sprintf("%s.%d.new", dest, attempt)
+			if err := os.WriteFile(tmp, raw, 0o755); err != nil {
+				lastErr = err
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			// 校验落盘完整性：杀软有时会「写入成功但内容被清空」
+			if st, err := os.Stat(tmp); err != nil || st.Size() != int64(len(raw)) {
+				os.Remove(tmp)
+				lastErr = fmt.Errorf("写入不完整（期望 %d 字节）", len(raw))
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			os.Remove(dest)
+			if err := os.Rename(tmp, dest); err != nil {
+				os.Remove(tmp)
+				lastErr = err
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			_ = os.WriteFile(stamp, []byte(want), 0o644)
+			dataRoot = d
+			if d != dir {
+				hostLog("主目录写入被拒，已降级到 %s", d)
+			}
 			return dest, nil
 		}
 	}
-	// 覆盖前先杀掉旧进程，否则文件被占用
-	killServerImage(dest)
-	tmp := dest + ".new"
-	if err := os.WriteFile(tmp, raw, 0o755); err != nil {
-		return "", err
+	if lastErr == nil {
+		lastErr = fmt.Errorf("未知原因")
 	}
-	os.Remove(dest)
-	if err := os.Rename(tmp, dest); err != nil {
-		return "", err
-	}
-	_ = os.WriteFile(stamp, []byte(want), 0o644)
-	return dest, nil
+	return "", lastErr
 }
 
 func killServerImage(path string) {
@@ -545,9 +800,13 @@ func showMenu(hwnd uintptr) {
 		pAppendMenuW.Call(menu, uintptr(flags), id, menuString(label))
 	}
 
-	// 标题行：当前地址
+	// 标题行：版本 + 当前地址
 	if st != nil {
-		appendItem(mfString|mfGrayed, 0, "Toneferry  ·  "+st.URL)
+		label := "Toneferry"
+		if st.Version != "" {
+			label += " v" + st.Version
+		}
+		appendItem(mfString|mfGrayed, 0, label+"  ·  "+st.URL)
 	} else if errText != "" {
 		appendItem(mfString|mfGrayed, 0, "服务未就绪："+errText)
 	} else {

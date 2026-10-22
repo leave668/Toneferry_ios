@@ -187,7 +187,8 @@ func applyGain(p []byte) {
 	}
 }
 
-func freeBuffer(bufs []*buffer) *buffer {	for _, b := range bufs {
+func freeBuffer(bufs []*buffer) *buffer {
+	for _, b := range bufs {
 		if !b.busy {
 			return b
 		}

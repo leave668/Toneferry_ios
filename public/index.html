@@ -1029,6 +1029,7 @@
         <span class="chip">锁屏播放</span>
         <span class="chip">WebSocket</span>
         <span class="chip">WASAPI Loopback</span>
+        <span class="chip" id="versionChip" title="当前运行的电脑端版本">v—</span>
       </div>
     </main>
 
@@ -1086,6 +1087,15 @@
       });
 
       updateUI();
+
+      // 电脑端版本号：排查「是不是装的旧版」时一眼就能看到
+      fetch("./api/status")
+        .then((r) => r.json())
+        .then((s) => {
+          const el = document.getElementById("versionChip");
+          if (el && s && s.version) el.textContent = "v" + s.version;
+        })
+        .catch(() => {});
     </script>
   </body>
 </html>
