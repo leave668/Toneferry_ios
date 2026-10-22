@@ -988,41 +988,13 @@ let micCtx = null
 /** @type {AudioWorkletNode | null} */
 let micNode = null
 let micSink = null
-let micWorkletUrl = null
 let micFrames = 0
+/** 采集正在建立中：防止并发建多个 AudioContext（会把 worklet 全局作用域搞乱） */
+let micStarting = false
 
-const MIC_WORKLET = `
-class TFMicrophone extends AudioWorkletProcessor {
-  constructor() {
-    super()
-    this.step = 48000 / sampleRate
-    this.frac = 0
-    this.buf = new Float32Array(960)
-    this.n = 0
-  }
-  flush() {
-    if (this.n > 0) {
-      this.port.postMessage(this.buf.slice(0, this.n))
-      this.n = 0
-    }
-  }
-  process(inputs) {
-    const ch = inputs[0] && inputs[0][0]
-    if (!ch) return true
-    // 最近邻重采样到 48k；设备本来就是 48k 时 step=1，等于直通
-    for (let i = 0; i < ch.length; i++) {
-      this.frac += this.step
-      while (this.frac >= 1) {
-        this.frac -= 1
-        this.buf[this.n++] = ch[i]
-        if (this.n >= 960) this.flush()
-      }
-    }
-    return true
-  }
-}
-registerProcessor('tf-mic', TFMicrophone)
-`
+// 采集 worklet 放在独立文件 public/mic-worklet.js 里加载。
+// 不要改回内联 Blob URL：并发调用时多个 AudioContext 抢同一个 blob 会抛
+// "AudioWorklet does not have a valid AudioWorkletGlobalScope"。
 
 function setMicUI() {
   if (!micBadge) return
@@ -1054,10 +1026,9 @@ function setMicUI() {
 }
 
 async function ensureMicWorklet(ctx) {
-  if (!micWorkletUrl) {
-    micWorkletUrl = URL.createObjectURL(new Blob([MIC_WORKLET], { type: 'text/javascript' }))
-  }
-  await ctx.audioWorklet.addModule(micWorkletUrl)
+  // 独立文件，直接走同源路径。每次 addModule 都是幂等的，
+  // 但必须 await 完成后再 new AudioWorkletNode。
+  await ctx.audioWorklet.addModule('./mic-worklet.js')
 }
 
 function sendMicFrame(f32) {
@@ -1075,13 +1046,24 @@ function sendMicFrame(f32) {
 }
 
 async function startMicCapture() {
-  if (micStream) return
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    micHint.textContent = '当前浏览器不支持麦克风采集（需要 HTTPS 或 localhost）。'
-    return
-  }
+  // 防重入是必须的：refreshLocalFlag 每 8 秒会调一次 applyMicState，
+  // 采集还没建好时 micStream 仍是 null，会被反复触发，多个 AudioContext
+  // 互相覆盖全局 micCtx，最终报
+  // "AudioWorklet does not have a valid AudioWorkletGlobalScope"。
+  if (micStream || micStarting) return
+  micStarting = true
+
+  let stream = null
+  let ctx = null
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      micHint.textContent = '当前浏览器不支持麦克风采集（需要 HTTPS 或 localhost）。'
+      micWanted = false
+      setMicUI()
+      return
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         echoCancellation: true,
@@ -1089,27 +1071,48 @@ async function startMicCapture() {
         autoGainControl: true,
       },
     })
+
+    ctx = new AudioContext({ sampleRate: 48000 })
+    if (ctx.state === 'suspended') await ctx.resume()
+    await ensureMicWorklet(ctx)
+
+    // 一定要用局部 ctx / node 构造，不能读写全局变量：
+    // 并发时全局变量可能已被另一个 context 覆盖。
+    const node = new AudioWorkletNode(ctx, 'tf-mic')
+    node.port.onmessage = (ev) => sendMicFrame(ev.data)
+
+    const src = ctx.createMediaStreamSource(stream)
+    src.connect(node)
+
+    // AudioWorkletNode 只有连到 destination 才会被驱动；用 0 增益避免自己外放
+    const sink = ctx.createGain()
+    sink.gain.value = 0
+    node.connect(sink)
+    sink.connect(ctx.destination)
+
+    // 全部成功后再一次性提交到全局状态
+    micStream = stream
+    micCtx = ctx
+    micNode = node
+    micSink = sink
   } catch (err) {
-    micHint.textContent = `无法打开麦克风：${err.message || err}`
-    micWanted = false
-    setMicUI()
-    return
+    // 失败必须把半成品清干净，否则下次点击会卡在 micStarting 或残留 track
+    try {
+      if (stream) for (const t of stream.getTracks()) t.stop()
+    } catch {
+      /* ignore */
+    }
+    if (ctx) {
+      try {
+        await ctx.close()
+      } catch {
+        /* ignore */
+      }
+    }
+    micHint.textContent = `麦克风启动失败：${(err && err.message) || err}`
+  } finally {
+    micStarting = false
   }
-
-  micCtx = new AudioContext({ sampleRate: 48000 })
-  if (micCtx.state === 'suspended') await micCtx.resume()
-  await ensureMicWorklet(micCtx)
-
-  micNode = new AudioWorkletNode(micCtx, 'tf-mic')
-  micNode.port.onmessage = (ev) => sendMicFrame(ev.data)
-  const src = micCtx.createMediaStreamSource(micStream)
-  src.connect(micNode)
-
-  // AudioWorkletNode 只有连到 destination 才会被驱动；用 0 增益避免自己外放
-  micSink = micCtx.createGain()
-  micSink.gain.value = 0
-  micNode.connect(micSink)
-  micSink.connect(micCtx.destination)
 }
 
 async function stopMicCapture() {
@@ -1145,6 +1148,18 @@ async function stopMicCapture() {
 }
 
 async function toggleMic() {
+  // 电脑本机页面上的「关闭麦克风」= 撤销授权，跨端生效。
+  // 否则手机端还在往上推，电脑这边只是自己不听，用户会觉得「点了关闭却没关掉」。
+  if (isLocalPage && micGranted) {
+    await control('revoke-mic')
+    micWanted = false
+    await stopMicCapture()
+    micGranted = false
+    micPending = false
+    setMicUI()
+    return
+  }
+
   if (micWanted) {
     micWanted = false
     await stopMicCapture()
@@ -1169,12 +1184,22 @@ async function toggleMic() {
 }
 
 function applyMicState(msg) {
-  const wasGranted = micGranted
   micGranted = !!msg.granted
   micPending = !!msg.pending
+
+  // 授权被撤销/拒绝：正在采集就立刻停掉，并把本地意图复位。
+  // 只在「确实在采集」时复位，避免服务端初始状态把用户的点击意图冲掉。
+  if (!micGranted && !micPending && micWanted && (micStream || micStarting)) {
+    micWanted = false
+    stopMicCapture().catch(() => {})
+  }
+
   setMicUI()
 
-  if (micWanted && micGranted && !wasGranted) {
+  // 只要「想开麦 + 已授权 + 还没在采集」就启动。
+  // 不能只判 !wasGranted：用户可能先点电脑端「授权」再点手机「麦克风」，
+  // 那种顺序下 micGranted 从始至终是 true，会永远不启动采集。
+  if (micWanted && micGranted && !micStream && !micStarting) {
     startMicCapture().catch((e) => {
       micHint.textContent = `麦克风启动失败：${e.message || e}`
     })
@@ -1264,12 +1289,14 @@ async function refreshLocalFlag() {
     if (j.mic) applyMicState(j.mic)
     setMicUI()
   } catch {
-    isLocalPage = false
+    // 保持上一次的判断：网络抖一下不该让「授权」按钮闪没
   }
 }
 
 refreshLocalFlag()
 refreshPeers()
+// 页面加载时服务端可能还没起来，本地标记要持续刷新，否则授权按钮永远不出现
+setInterval(refreshLocalFlag, 8000)
 setInterval(refreshPeers, 8000)
 
 window.__toneferry = {

@@ -25,6 +25,7 @@
     UIButton *_pipButton;
     UIButton *_micButton;
     UIButton *_historyButton;
+    UILabel *_versionLabel;
     UIView *_pipHostView;
     TFPiPController *_pipController;
     TFPlayer *_player;
@@ -51,7 +52,10 @@ static NSString *const kLatencyKey = @"tf.latency";
 
     _subLabel = [self labelWithSize:13 weight:UIFontWeightRegular
                               color:[UIColor colorWithRed:0.58 green:0.64 blue:0.72 alpha:1.0]];
-    _subLabel.text = @"PC 系统音频 · 锁屏继续播放";
+    // 版本号直接写在副标题里，升级后一眼能确认装的是哪个包
+    _subLabel.text = [NSString stringWithFormat:@"PC 系统音频 · 锁屏继续播放 · %@", [self versionText]];
+    _subLabel.adjustsFontSizeToFitWidth = YES;
+    _subLabel.minimumScaleFactor = 0.75;
 
     _hostField = [[UITextField alloc] init];
     _hostField.backgroundColor = [UIColor colorWithRed:0.106 green:0.106 blue:0.188 alpha:1.0];
@@ -164,6 +168,15 @@ static NSString *const kLatencyKey = @"tf.latency";
     _hintLabel.numberOfLines = 0;
     [self.view addSubview:_hintLabel];
 
+    // 独立的版本标签：副标题里也拼了版本号，但那一行可能被系统按
+    // adjustsFontSizeToFitWidth 压小后截断，这里再放一个绝不会被截断的。
+    _versionLabel = [self labelWithSize:11 weight:UIFontWeightMedium
+                                  color:[UIColor colorWithRed:0.35 green:0.41 blue:0.5 alpha:1.0]];
+    _versionLabel.text = [NSString stringWithFormat:@"Toneferry for iOS  %@", [self versionText]];
+    _versionLabel.textAlignment = NSTextAlignmentRight;
+    [self.view addSubview:_versionLabel];
+    NSLog(@"[tf] Toneferry iOS %@ 启动", [self versionText]);
+
     _player = [[TFPlayer alloc] init];
     _player.delegate = self;
     _player.host = _hostField.text;
@@ -203,8 +216,16 @@ static NSString *const kLatencyKey = @"tf.latency";
     [_pipController prepare];
 }
 
-- (NSInteger)savedLatencyIndex {
-    NSInteger v = [[NSUserDefaults standardUserDefaults] integerForKey:kLatencyKey];
+- (NSString *)versionText {
+    NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
+    NSString *shortV = info[@"CFBundleShortVersionString"];
+    NSString *build = info[@"CFBundleVersion"];
+    if (!shortV.length) shortV = @"?";
+    if (!build.length) build = @"?";
+    return [NSString stringWithFormat:@"v%@ (%@)", shortV, build];
+}
+
+- (NSInteger)savedLatencyIndex {    NSInteger v = [[NSUserDefaults standardUserDefaults] integerForKey:kLatencyKey];
     if (v < 0 || v > 2) return 1;
     return v;
 }
@@ -265,6 +286,7 @@ static NSString *const kLatencyKey = @"tf.latency";
     CGFloat hintH = 36;
     CGFloat hintY = self.view.bounds.size.height - self.view.safeAreaInsets.bottom - hintH - 12;
     _hintLabel.frame = CGRectMake(pad, hintY, contentW, hintH);
+    _versionLabel.frame = CGRectMake(pad, hintY - 18, contentW, 14);
 }
 
 #pragma mark - 交互

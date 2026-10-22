@@ -8,8 +8,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"syscall"
 	"time"
@@ -26,6 +28,11 @@ const (
 	waveFormatIEEEFloat = 0x0003
 	whdrDone            = 0x00000001
 	waveMapper          = 0xFFFFFFFF
+
+	// 手机麦克风的电平普遍偏低（系统不做 AGC，离嘴又远），
+	// 直接放出来几乎听不清。用 tanh 做软限幅：小信号线性放大，
+	// 大信号平滑压到 ±1，不会像硬乘法那样削顶爆音。
+	inputGain = 3.0
 )
 
 type waveFormatEx struct {
@@ -148,6 +155,7 @@ func main() {
 		}
 
 		copy(b.data, pending[:bufSize])
+		applyGain(b.data)
 		b.hdr.Flags &^= whdrDone // 上一轮的 DONE 必须清掉，否则 waveOutWrite 会拒绝
 		pending = pending[bufSize:]
 		b.busy = true
@@ -164,8 +172,22 @@ func main() {
 	}
 }
 
-func freeBuffer(bufs []*buffer) *buffer {
-	for _, b := range bufs {
+// applyGain 就地放大一块 Float32 PCM。
+// tanh 软限幅：|x| 小时 tanh(gx) ≈ gx（等于线性增益），
+// |x| 大时平滑趋向 ±1，不会出现硬削顶的方波失真。
+func applyGain(p []byte) {
+	for i := 0; i+4 <= len(p); i += 4 {
+		bits := binary.LittleEndian.Uint32(p[i:])
+		f := math.Float32frombits(bits)
+		if f == 0 {
+			continue
+		}
+		g := float32(math.Tanh(float64(f) * inputGain))
+		binary.LittleEndian.PutUint32(p[i:], math.Float32bits(g))
+	}
+}
+
+func freeBuffer(bufs []*buffer) *buffer {	for _, b := range bufs {
 		if !b.busy {
 			return b
 		}

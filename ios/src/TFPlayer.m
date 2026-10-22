@@ -206,6 +206,20 @@ static OSStatus pipeRender(TFAudioPipe *p,
 @interface TFPlayer () <NSURLSessionWebSocketDelegate>
 @end
 
+/// 私有方法前置声明：这些方法在 @implementation 里定义得较晚，
+/// 不声明会触发 "instance method not found" 警告。
+@interface TFPlayer (Private)
+- (void)activateSession;
+- (void)restartGraphIfNeeded;
+- (void)notifyMicState;
+- (void)startMicEngine;
+- (void)stopMicEngine;
+- (void)failMicStart:(NSString *)reason;
+- (void)sendJSON:(NSDictionary *)obj;
+- (void)sendMicBuffer:(AVAudioPCMBuffer *)buffer;
+- (void)setState:(TFPlayerState)state detail:(NSString *)detail;
+@end
+
 @implementation TFPlayer {
     TFAudioPipe *_pipe;
 
@@ -226,6 +240,14 @@ static OSStatus pipeRender(TFAudioPipe *p,
     AVAudioConverter *_micConverter;
     AVAudioFormat *_micOutFormat;
     unsigned long long _micFrames;
+    /// session 已切到 playAndRecord（开过麦就常驻，避免来回切类别反复打断播放引擎）
+    BOOL _micSession;
+    /// 采集启动失败（权限被拒 / 无输入设备），不再自动重试，等用户手动重开
+    BOOL _micStartFailed;
+    /// 防止配置变更回调重入
+    BOOL _restartingGraph;
+    /// 配置修复节流（类别切换会连环触发通知，1 秒内只修一次）
+    NSTimeInterval _lastConfigFix;
     BOOL _reconnectPending;
     NSUInteger _reconnectAttempt;
     double _streamRate;
@@ -282,6 +304,12 @@ static OSStatus pipeRender(TFAudioPipe *p,
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(handleMediaServicesReset:)
                                                  name:AVAudioSessionMediaServicesWereResetNotification
+                                               object:nil];
+    // 关键：切换 AVAudioSession 类别（.playback ↔ .playAndRecord）会让 AVAudioEngine 停止运行，
+    // 系统只发这条通知，不注册就永远收不到 —— 表现就是「一开麦克风下行就彻底没声」。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleEngineConfigChange:)
+                                                 name:AVAudioEngineConfigurationChangeNotification
                                                object:nil];
 
     [self setupRemoteCommands];
@@ -356,6 +384,9 @@ static OSStatus pipeRender(TFAudioPipe *p,
         self->_micGranted = NO;
         self->_micWaiting = NO;
         [self stopMicEngine];
+        // 整条链路停止时把会话偏好复位，下次「开始收听」回到纯 .playback
+        self->_micSession = NO;
+        self->_micStartFailed = NO;
         [self closeTask];
         [self stopTimers];
         [self teardownGraph];
@@ -390,6 +421,8 @@ static OSStatus pipeRender(TFAudioPipe *p,
             return;
         }
         // 请求开麦：未授权时服务端会回 mic-state(granted:NO,pending:YES)
+        // 用户手动重开 = 一次明确的重试机会，清掉上次的失败标记
+        self->_micStartFailed = NO;
         self->_micWaiting = YES;
         [self sendJSON:@{ @"type": @"mic-open" }];
         [self notifyMicState];
@@ -413,6 +446,12 @@ static OSStatus pipeRender(TFAudioPipe *p,
     _micGranted = granted;
     _micWaiting = !granted && pending;
 
+    // 电脑端撤销授权后，开关本身也要复位：
+    // 否则 _micEnabled 还是 YES，用户再点一下会走「关闭」分支，要连点两次才能重开。
+    if (!granted && !pending) {
+        _micEnabled = NO;
+    }
+
     if (_micEnabled && granted && (!wasGranted || (active && !_micEngine))) {
         [self startMicEngine];
     }
@@ -422,23 +461,68 @@ static OSStatus pipeRender(TFAudioPipe *p,
     [self notifyMicState];
 }
 
+- (void)failMicStart:(NSString *)reason {
+    NSLog(@"[mic] 采集不可用：%@", reason);
+    _micStartFailed = YES;
+    _micGranted = NO;
+    _micWaiting = NO;
+    // 不回切类别：playAndRecord 一样能正常播放，少一次打断就少一次哑火
+    [self restartGraphIfNeeded];
+    [self notifyMicState];
+}
+
 - (void)startMicEngine {
     if (_micEngine) return;
+    // 上次失败过就不再自动重试：否则每收到一条 mic-state 都会重切一次类别，
+    // 播放引擎被反复打断，表现就是「越点越没声」。
+    if (_micStartFailed) return;
 
-    // 播放 + 录音必须用 playAndRecord，否则 inputNode 拿不到数据
     AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayAndRecord
-             withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker |
-                         AVAudioSessionCategoryOptionAllowBluetooth
-                   error:nil];
-    [session setActive:YES error:nil];
+
+    // 必须先显式请求录音权限。不请求时 inputNode 能连上、引擎能启动，
+    // 但缓冲区永远是静音 —— 电脑端表现为「授权了、一点声音都没有」。
+    if (session.recordPermission == AVAudioSessionRecordPermissionUndetermined) {
+        __weak typeof(self) weakSelf = self;
+        [session requestRecordPermission:^(BOOL granted) {
+            dispatch_async(self->_workQueue, ^{
+                TFPlayer *s = weakSelf;
+                if (!s) return;
+                if (granted) {
+                    s->_micStartFailed = NO;
+                    [s startMicEngine];
+                } else {
+                    [s failMicStart:@"用户拒绝了录音权限（设置 → Toneferry → 麦克风）"];
+                }
+            });
+        }];
+        return;
+    }
+    if (session.recordPermission == AVAudioSessionRecordPermissionDenied) {
+        [self failMicStart:@"录音权限被拒（设置 → Toneferry → 麦克风）"];
+        return;
+    }
+
+    // 播放 + 录音必须用 playAndRecord，否则 inputNode 拿不到数据。
+    // 类别与选项统一走 activateSession，只在一处维护。
+    _micSession = YES;
+    [self activateSession];
 
     AVAudioEngine *engine = [[AVAudioEngine alloc] init];
     AVAudioInputNode *input = engine.inputNode;
     AVAudioFormat *inFormat = [input outputFormatForBus:0];
-    if (!inFormat || inFormat.sampleRate <= 0) {
-        NSLog(@"[mic] 输入格式不可用");
+    if (!inFormat || inFormat.sampleRate <= 0 || inFormat.channelCount == 0) {
+        NSLog(@"[mic] 输入格式不可用: %@", inFormat);
+        [self failMicStart:@"没有可用的麦克风输入"];
         return;
+    }
+
+    // 关掉系统 AEC：它会把下行声音从麦克风信号里减掉，还会把输出路由拉到语音模式，
+    // 让下行音质明显变闷。Toneferry 的上行就是「对着手机说话」，不需要 AEC。
+    if ([input respondsToSelector:@selector(setVoiceProcessingEnabled:error:)]) {
+        NSError *vpErr = nil;
+        if (![input setVoiceProcessingEnabled:NO error:&vpErr]) {
+            NSLog(@"[mic] 关闭 AEC 失败（忽略）: %@", vpErr);
+        }
     }
 
     _micOutFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
@@ -447,7 +531,8 @@ static OSStatus pipeRender(TFAudioPipe *p,
                                                     interleaved:NO];
     _micConverter = [[AVAudioConverter alloc] initFromFormat:inFormat toFormat:_micOutFormat];
     if (!_micConverter) {
-        NSLog(@"[mic] 无法创建重采样器 %@", inFormat);
+        NSLog(@"[mic] 无法创建重采样器 %@ → 48000", inFormat);
+        [self failMicStart:@"重采样器创建失败"];
         return;
     }
 
@@ -490,24 +575,36 @@ static OSStatus pipeRender(TFAudioPipe *p,
     if (![engine startAndReturnError:&startErr]) {
         NSLog(@"[mic] 采集启动失败: %@", startErr);
         [input removeTapOnBus:0];
+        [self failMicStart:@"麦克风启动失败"];
         return;
     }
     _micEngine = engine;
     NSLog(@"[mic] 上行采集已启动 %.0fHz → 48000Hz", inRate);
+
+    // 压低下行音量，打断「手机扬声器 → 手机麦克风 → 电脑扬声器 → loopback」的声学环路
+    if (_engine) _engine.mainMixerNode.outputVolume = 0.2;
+
+    // 切类别刚刚打断了播放引擎，立刻把它拉回来
+    [self restartGraphIfNeeded];
 }
 
 - (void)stopMicEngine {
-    if (!_micEngine) return;
-    [_micEngine.inputNode removeTapOnBus:0];
-    [_micEngine stop];
-    _micEngine = nil;
+    if (_micEngine) {
+        [_micEngine.inputNode removeTapOnBus:0];
+        [_micEngine stop];
+        _micEngine = nil;
+    }
     _micConverter = nil;
-    // 回到纯播放类别，避免录音路由影响下行音质
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayback
-             withOptions:AVAudioSessionCategoryOptionMixWithOthers
-                   error:nil];
-    [session setActive:YES error:nil];
+    _micOutFormat = nil;
+    _micStartFailed = NO;
+    // 麦克风关了，下行音量恢复正常
+    if (_engine) _engine.mainMixerNode.outputVolume = 1.0;
+
+    // 关键：不再把类别切回 .playback。
+    // 切回去又是一次配置变更，播放引擎会再被打断一次 ——
+    // 这正是「关掉麦克风之后照样没声音，非得停止收听再重开」的根因。
+    // 保持 .playAndRecord（DefaultToSpeaker）完全可以正常播放。
+    [self restartGraphIfNeeded];
 }
 
 - (void)sendMicBuffer:(AVAudioPCMBuffer *)buffer {
@@ -553,11 +650,22 @@ static OSStatus pipeRender(TFAudioPipe *p,
 - (void)activateSession {
     AVAudioSession *s = [AVAudioSession sharedInstance];
     NSError *err = nil;
-    // .playback 是锁屏继续出声的前提；mode 用 default 保证纯直通，不引入系统侧 DSP
-    if (![s setCategory:AVAudioSessionCategoryPlayback
-                   mode:AVAudioSessionModeDefault
-                options:0
-                  error:&err]) {
+
+    // 开过麦克风之后 session 常驻 .playAndRecord：来回切类别会二次打断播放引擎，
+    // 每次打断都要重建整张音频图，既费时又容易在切换瞬间吞掉声音。
+    AVAudioSessionCategory category = _micSession
+        ? AVAudioSessionCategoryPlayAndRecord
+        : AVAudioSessionCategoryPlayback;
+    AVAudioSessionCategoryOptions opts = 0;
+    if (_micSession) {
+        // .playAndRecord 默认输出走听筒，不指定 DefaultToSpeaker 会「几乎听不见」；
+        // 蓝牙用 A2DP 而不是 HFP，否则输出会被降到 8k/16k 单声道，下行直接变闷。
+        opts = AVAudioSessionCategoryOptionDefaultToSpeaker |
+               AVAudioSessionCategoryOptionAllowBluetoothA2DP;
+    }
+
+    // mode 用 default 保证纯直通，不引入系统侧语音 DSP
+    if (![s setCategory:category mode:AVAudioSessionModeDefault options:opts error:&err]) {
         NSLog(@"[tf] setCategory failed: %@", err);
     }
     if (![s setPreferredIOBufferDuration:0.005 error:nil]) {
@@ -571,6 +679,42 @@ static OSStatus pipeRender(TFAudioPipe *p,
     }
     NSTimeInterval io = s.IOBufferDuration;
     if (io > 0) _ioBufferMs = io * 1000.0;
+}
+
+/**
+ * AVAudioEngine 因会话配置变化而停止时的自救。
+ *
+ * 切 .playAndRecord、插拔耳机、蓝牙切换都会触发。不处理的话引擎就此停摆，
+ * 而 _wantPlaying 仍是 YES，界面显示「播放中」但没有一点声音。
+ */
+- (void)handleEngineConfigChange:(NSNotification *)note {
+    dispatch_async(_workQueue, ^{
+        if (!self->_wantPlaying) return;
+        if (!self->_graphReady) return;   // 图还没建好，start 流程会自己处理
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - self->_lastConfigFix < 1.0) return;   // 连环通知只修一次
+
+        // 一切正常就别折腾：恢复动作本身也可能触发新的配置变更，形成抖动
+        BOOL playOk = self->_engine && self->_engine.isRunning;
+        BOOL micOk = !self->_micEngine || self->_micEngine.isRunning;
+        if (playOk && micOk) return;
+
+        self->_lastConfigFix = now;
+        NSLog(@"[tf] 音频引擎配置变更，尝试恢复");
+        [self activateSession];
+        [self restartGraphIfNeeded];
+
+        // 采集引擎同样会被打断，能重启就重启，不行就置失败位等用户重开
+        if (self->_micEngine && !self->_micEngine.isRunning) {
+            NSError *e = nil;
+            if (![self->_micEngine startAndReturnError:&e]) {
+                NSLog(@"[mic] 配置变更后重启采集失败: %@", e);
+                [self stopMicEngine];
+                self->_micStartFailed = YES;
+                [self notifyMicState];
+            }
+        }
+    });
 }
 
 - (void)handleInterruption:(NSNotification *)note {
@@ -613,13 +757,22 @@ static OSStatus pipeRender(TFAudioPipe *p,
 }
 
 - (void)restartGraphIfNeeded {
+    if (!_wantPlaying) return;
+    if (_restartingGraph) return;
     if (!_graphReady || !_engine) return;
     if (_engine.isRunning) return;
+    _restartingGraph = YES;
     NSError *err = nil;
     if (![_engine startAndReturnError:&err]) {
+        NSLog(@"[tf] 引擎重启失败，重建音频图: %@", err);
         [self teardownGraph];
-        [self setupGraph:_streamRate];
+        if (![self setupGraph:_streamRate]) {
+            [self setState:TFPlayerStateFailed detail:@"音频图重建失败"];
+        }
+    } else {
+        NSLog(@"[tf] 引擎已恢复运行");
     }
+    _restartingGraph = NO;
 }
 
 #pragma mark - 音频图
@@ -673,7 +826,10 @@ static OSStatus pipeRender(TFAudioPipe *p,
 
     [_engine attachNode:_source];
     [_engine connect:_source to:_engine.mainMixerNode format:_fmt];
-    _engine.mainMixerNode.outputVolume = 1.0;
+    // 开麦时把下行压低：手机扬声器放出来的声音会被手机麦克风采回去，
+    // 再经电脑扬声器 → WASAPI loopback → 手机，形成完整声学环路（啸叫）。
+    // 0.2 的增益把环路增益压到远小于 1，既能听见又不啸叫。
+    _engine.mainMixerNode.outputVolume = _micEngine ? 0.2 : 1.0;
 
     NSError *err = nil;
     if (![_engine startAndReturnError:&err]) {

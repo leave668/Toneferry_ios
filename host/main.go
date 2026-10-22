@@ -28,7 +28,7 @@ import (
 	"unsafe"
 )
 
-//go:embed assets/ToneferryServer.exe
+//go:embed assets
 var assets embed.FS
 
 const (
@@ -67,6 +67,14 @@ const (
 	tpmReturnCmd   = 0x0100
 
 	idiApplication = 32512
+
+	// CreateWindowExW 的 dwStyle 不能是 0：没有 WS_POPUP / WS_OVERLAPPED / WS_CHILD
+	// 的顶层窗口会被系统拒绝创建，返回 NULL。窗口拿不到句柄，Shell_NotifyIcon 就
+	// 一定失败 —— 表现就是「程序在跑，但右下角没有图标」。
+	wsPopup = 0x80000000
+
+	imageIcon     = 1
+	lrLoadFromFile = 0x00000010
 
 	createNoWindow = 0x08000000
 )
@@ -164,6 +172,7 @@ var (
 	pLoadIconW         = user32.NewProc("LoadIconW")
 	pShellNotifyIconW  = shell32.NewProc("Shell_NotifyIconW")
 	pExtractIconExW    = shell32.NewProc("ExtractIconExW")
+	pLoadImageW        = user32.NewProc("LoadImageW")
 	pShellExecuteW     = shell32.NewProc("ShellExecuteW")
 	pCreateMutexW      = kernel32.NewProc("CreateMutexW")
 )
@@ -203,7 +212,9 @@ func main() {
 		return
 	}
 
-	hIcon = loadIcon(serverExe)
+	icoPath := extractIcon(dir)
+	hIcon = loadIcon(serverExe, icoPath)
+	hostLog("启动：ico=%q hIcon=%d", icoPath, hIcon)
 
 	if err := startServer(); err != nil {
 		messageBox("Toneferry 启动失败", "服务端启动失败："+err.Error())
@@ -309,7 +320,45 @@ func startServer() error {
 	return nil
 }
 
-func loadIcon(exePath string) uintptr {
+// extractIcon 把内嵌的 icon.ico 释放到数据目录，供 LoadImageW 直接从文件加载。
+func extractIcon(dir string) string {
+	raw, err := assets.ReadFile("assets/icon.ico")
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	dest := filepath.Join(dir, "icon.ico")
+	if st, err := os.Stat(dest); err == nil && st.Size() == int64(len(raw)) {
+		return dest
+	}
+	tmp := dest + ".new"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return ""
+	}
+	os.Remove(dest)
+	if err := os.Rename(tmp, dest); err != nil {
+		return ""
+	}
+	return dest
+}
+
+func loadIcon(exePath, icoPath string) uintptr {
+	// 首选直接从 ico 文件加载：不依赖 exe 内部的图标资源索引。
+	// pkg 打出来的 exe 是用 resedit 后盖图标的，ExtractIconEx 的索引未必对得上。
+	if icoPath != "" {
+		if p, err := syscall.UTF16PtrFromString(icoPath); err == nil {
+			h, _, _ := pLoadImageW.Call(
+				0,
+				uintptr(unsafe.Pointer(p)),
+				imageIcon,
+				0, 0,
+				lrLoadFromFile,
+			)
+			if h != 0 {
+				return h
+			}
+		}
+	}
+
 	var large, small uintptr
 	p, _ := syscall.UTF16PtrFromString(exePath)
 	n, _, _ := pExtractIconExW.Call(uintptr(unsafe.Pointer(p)), 0, uintptr(unsafe.Pointer(&large)), uintptr(unsafe.Pointer(&small)), 1)
@@ -326,9 +375,14 @@ func loadIcon(exePath string) uintptr {
 /* ------------------------------ 窗口 / 托盘 ------------------------------ */
 
 func createTrayWindow() {
+	hostLog("createTrayWindow 开始")
 	hInst, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	clsName, _ := syscall.UTF16PtrFromString(windowClass)
+	hostLog("hInst=%d", hInst)
 
+	// 注意必须包含 HIconSm：WNDCLASSEXW 在 x64 下是 80 字节，
+	// 少这个字段 cbSize 就只有 72，RegisterClassExW 会直接返回 0，
+	// 窗口创建不出来，Shell_NotifyIcon 自然也不可能成功。
 	wc := struct {
 		CbSize        uint32
 		Style         uint32
@@ -341,24 +395,55 @@ func createTrayWindow() {
 		HbrBackground uintptr
 		LpszMenuName  uintptr
 		LpszClassName uintptr
+		HIconSm       uintptr
 	}{}
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
 	wc.LpfnWndProc = syscall.NewCallback(wndProc)
 	wc.HInstance = hInst
 	wc.HIcon = hIcon
+	wc.HIconSm = hIcon
 	wc.LpszClassName = uintptr(unsafe.Pointer(clsName))
 
-	pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+	atom, _, regErr := pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+	if atom == 0 {
+		hostLog("RegisterClassExW 失败 err=%v（cbSize=%d）", regErr, wc.CbSize)
+		messageBox("Toneferry 启动失败", "注册窗口类失败，无法显示托盘图标。")
+		return
+	}
+	hostLog("窗口类已注册 atom=%d cbSize=%d", atom, wc.CbSize)
 
 	title, _ := syscall.UTF16PtrFromString(appName)
 	hwnd, _, _ := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsName)),
 		uintptr(unsafe.Pointer(title)),
-		0, 0, 0, 0, 0, 0, 0, hInst, 0,
+		wsPopup, // 必须是 WS_POPUP：dwStyle=0 的顶层窗口会被拒绝创建
+		0, 0, 0, 0,
+		0, 0, hInst, 0,
 	)
+	if hwnd == 0 {
+		hostLog("CreateWindowExW 返回 0，无法创建托盘窗口")
+		messageBox("Toneferry 启动失败", "创建托盘窗口失败，无法显示托盘图标。")
+		return
+	}
 	hwndMain = hwnd
+	hostLog("窗口已创建 hwnd=%d", hwnd)
 	addTrayIcon()
+}
+
+// hostLog 把宿主的关键事件写进 %LOCALAPPDATA%\Toneferry\host.log。
+// 托盘图标这种事在界面上看不出来，没有日志就没法排查。
+func hostLog(format string, args ...any) {
+	dir, err := dataDir()
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "host.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
 }
 
 func addTrayIcon() {
@@ -371,7 +456,28 @@ func addTrayIcon() {
 	nid.HIcon = hIcon
 	tip := syscall.StringToUTF16(appName + " · 系统音频推流")
 	copy(nid.SzTip[:], tip)
-	pShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+
+	ok, _, _ := pShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+	if ok != 0 {
+		hostLog("托盘图标已注册 hwnd=%d hIcon=%d", hwndMain, hIcon)
+		return
+	}
+
+	// 第一次失败最常见的原因是 HICON 无效（图标资源取不到），
+	// 换成系统默认图标再试一次，至少保证托盘里有东西可点。
+	hostLog("托盘图标首次注册失败，改用系统默认图标重试")
+	fallback, _, _ := pLoadIconW.Call(0, idiApplication)
+	if fallback != 0 {
+		hIcon = fallback
+		nid.HIcon = fallback
+		ok, _, _ = pShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+		if ok != 0 {
+			hostLog("托盘图标已用系统默认图标注册")
+			return
+		}
+	}
+	hostLog("托盘图标注册失败（Shell_NotifyIcon 返回 0）")
+	messageBox("Toneferry", "托盘图标注册失败，程序仍在后台运行，可直接访问网页控制。")
 }
 
 func balloon(title, text string, flags uint32) {

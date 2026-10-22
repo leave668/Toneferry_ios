@@ -32,6 +32,10 @@ export function createMicChannel({ playerPath, log = () => {}, onState = () => {
   let player = null
   let frames = 0
   let dropped = 0
+  /** 播放器启动失败后的退避截止时间：避免每帧都尝试 spawn 一个必然失败的进程 */
+  let playerFailUntil = 0
+  const PLAYER_RETRY_MS = 5000
+  let lastPlayerError = ''
 
   const state = () => ({
     granted,
@@ -41,24 +45,33 @@ export function createMicChannel({ playerPath, log = () => {}, onState = () => {
     frames,
     dropped,
     playerReady: !!player,
+    playerError: lastPlayerError,
   })
 
   const emit = () => onState(state())
 
   function ensurePlayer() {
     if (player) return player
+    if (Date.now() < playerFailUntil) return null
     if (!playerPath || !fs.existsSync(playerPath)) {
+      lastPlayerError = '缺少播放器'
+      playerFailUntil = Date.now() + PLAYER_RETRY_MS
       log(`[mic] 缺少播放器：${playerPath || '(未配置)'}，手机麦克风将无声`)
       return null
     }
     try {
       player = spawn(playerPath, [], { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true })
     } catch (err) {
+      lastPlayerError = err.message
+      playerFailUntil = Date.now() + PLAYER_RETRY_MS
       log(`[mic] 播放器启动失败：${err.message}`)
       player = null
       return null
     }
+    lastPlayerError = ''
     player.on('error', (err) => {
+      lastPlayerError = err.message
+      playerFailUntil = Date.now() + PLAYER_RETRY_MS
       log(`[mic] 播放器错误：${err.message}`)
       player = null
     })
@@ -67,10 +80,17 @@ export function createMicChannel({ playerPath, log = () => {}, onState = () => {
       if (s) log(`[mic:player] ${s}`)
     })
     player.on('exit', (code) => {
-      if (code !== 0) log(`[mic] 播放器退出 code=${code}`)
+      if (code !== 0) {
+        lastPlayerError = `播放器退出 code=${code}（可能没有可用的输出设备）`
+        // 非正常退出要退避，否则下一帧又会 spawn 一个同样会立刻退出的进程
+        playerFailUntil = Date.now() + PLAYER_RETRY_MS
+        log(`[mic] ${lastPlayerError}`)
+      }
       player = null
     })
-    player.stdin.on('error', () => {
+    player.stdin.on('error', (err) => {
+      lastPlayerError = err.message
+      playerFailUntil = Date.now() + PLAYER_RETRY_MS
       player = null
     })
     log('[mic] 播放器已启动（48000 Hz / 单声道 / Float32）')

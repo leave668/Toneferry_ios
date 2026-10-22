@@ -312,7 +312,14 @@ function printStartupBanner(host, port) {
   console.log(`    4. 点击页面「开始收听」`)
   console.log('')
   console.log(`  ${c.magenta}${c.bold}注意事项${c.reset}\n`)
-  console.log(`    · 请保持本窗口开着，${c.yellow}关闭窗口即停止服务${c.reset}`)
+  // 托盘模式下没有控制台窗口，原来「关闭本窗口即停止服务」的说法会让人以为
+  // 必须留着一个看不见的窗口，实际退出入口是任务栏右下角的托盘图标。
+  const trayMode = !process.stdout.isTTY
+  console.log(
+    trayMode
+      ? `    · 程序在${c.yellow}任务栏右下角托盘${c.reset}，右键图标可授权麦克风 / 查看最近 IP / 退出`
+      : `    · 请保持本窗口开着，${c.yellow}关闭窗口即停止服务${c.reset}`,
+  )
   console.log(`    · ${c.yellow}请将音频输出设备设为主机自带扬声器${c.reset}（系统声音 → 输出），勿选 USB 声卡 / 耳机等外置设备`)
   console.log(`    · 手机与电脑必须在同一局域网，访客网络可能不通`)
   console.log(`    · 若打不开页面，检查 Windows 防火墙是否放行端口 ${port}`)
@@ -320,7 +327,11 @@ function printStartupBanner(host, port) {
   console.log(`    · 若锁屏后无声：手机浏览器设置里允许该站点「后台播放 / 不受流量节省限制」`)
   console.log(`    · 本机也可打开：${localUrl}`)
   console.log('')
-  console.log(`  ${c.dim}停止服务：关闭本窗口，或按 Ctrl+C${c.reset}`)
+  console.log(
+    trayMode
+      ? `  ${c.dim}停止服务：右键托盘图标 → 退出（或任务管理器结束 Toneferry.exe）${c.reset}`
+      : `  ${c.dim}停止服务：关闭本窗口，或按 Ctrl+C${c.reset}`,
+  )
   console.log(`${c.cyan}${c.bold}  ${line}${c.reset}`)
   console.log('')
 }
@@ -334,10 +345,39 @@ function sendJson(res, code, obj) {
   res.end(body)
 }
 
+/**
+ * 本机地址集合（缓存 5 秒，网卡变动不频繁）。
+ *
+ * 只认 127.0.0.1 是不够的：用户在电脑浏览器里通常输入的是局域网地址
+ * http://192.168.0.80:3088/ ，此时 remoteAddress 是本机网卡 IP，不是回环地址，
+ * 于是「授权手机麦克风」按钮会判成非本机而消失、/api/control 直接 403 ——
+ * 表现就是「电脑上根本授权不了」。
+ */
+let localAddrCache = { at: 0, set: new Set() }
+function localAddresses() {
+  const now = Date.now()
+  if (now - localAddrCache.at < 5000 && localAddrCache.set.size) return localAddrCache.set
+  const set = new Set(['127.0.0.1', '::1'])
+  try {
+    const ifaces = os.networkInterfaces()
+    for (const name of Object.keys(ifaces)) {
+      for (const it of ifaces[name] || []) {
+        if (it && it.address) set.add(it.address)
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  localAddrCache = { at: now, set }
+  return set
+}
+
 /** 控制类接口只允许本机调用：不能让局域网里的手机自己给自己授权麦克风。 */
 function isLoopback(req) {
-  const ip = String((req.socket && req.socket.remoteAddress) || '')
-  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
+  let ip = String((req.socket && req.socket.remoteAddress) || '')
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7)
+  if (ip === '::1') ip = '127.0.0.1'
+  return localAddresses().has(ip)
 }
 
 function readBody(req, limit = 64 * 1024) {
