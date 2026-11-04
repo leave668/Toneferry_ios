@@ -28,7 +28,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
+	unsafe "unsafe"
+
+	"toneferry/player"
 )
 
 //go:embed assets
@@ -92,6 +94,8 @@ const (
 	idOpenPage
 	idOpenLog
 	idClearPeers
+	idDefenderExclusion
+	idDiagnose
 	idQuit
 )
 
@@ -120,10 +124,15 @@ type serverStatus struct {
 	URL            string     `json:"url"`
 	StreamEnabled  bool       `json:"streamEnabled"`
 	CaptureRunning bool       `json:"captureRunning"`
-	Mic            micState   `json:"mic"`
-	NativeCount    int        `json:"nativeCount"`
-	Clients        int        `json:"clients"`
-	Peers          []peerInfo `json:"peers"`
+	// AudioActive 表示电脑当前真的有声音输出。
+	// 总闸开着但电脑静音时，托盘不能写「推流中」让人以为在放声音，
+	// 必须区分「有声 / 静音」两种状态。
+	AudioActive  bool       `json:"audioActive"`
+	AudioFrames  int64      `json:"audioFrames"`
+	Mic          micState   `json:"mic"`
+	NativeCount  int        `json:"nativeCount"`
+	Clients      int        `json:"clients"`
+	Peers        []peerInfo `json:"peers"`
 }
 
 type notifyIconData struct {
@@ -199,6 +208,18 @@ func main() {
 
 	if len(os.Args) > 1 && (os.Args[1] == "--diagnose" || os.Args[1] == "/diagnose") {
 		runDiagnose()
+		return
+	}
+
+	// 播放器模式：把 stdin 的 PCM 播到默认输出设备。
+	// 服务端在手机开麦时拉起这个子进程 —— 复用宿主自身，
+	// 电脑上就不会多出一个独立的 audio-play.exe（少一个杀软盯上的目标）。
+	// 必须在单实例互斥体之前判断：这个子进程不是托盘实例。
+	if len(os.Args) > 1 && (os.Args[1] == "--mic-player" || os.Args[1] == "/mic-player") {
+		if err := player.Run(os.Stdin); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -363,6 +384,8 @@ func runDiagnose() {
 			fmt.Fprintf(&b, "%-22s 缺失\r\n", n)
 		}
 	}
+	fmt.Fprintf(&b, "\r\n--- Defender 排除状态 ---\r\n")
+	fmt.Fprintf(&b, "%s\r\n", defenderExclusionStatus())
 	fmt.Fprintf(&b, "\r\n--- host.log ---\r\n%s\r\n", logTail(filepath.Join(dir, "host.log"), 4000))
 	fmt.Fprintf(&b, "\r\n--- toneferry.log ---\r\n%s\r\n", logTail(filepath.Join(dir, "toneferry.log"), 4000))
 
@@ -375,6 +398,47 @@ func runDiagnose() {
 	verb, _ := syscall.UTF16PtrFromString("open")
 	target, _ := syscall.UTF16PtrFromString(out)
 	pShellExecuteW.Call(0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(target)), 0, 0, 1)
+}
+
+func addDefenderExclusion() {
+	self := mustExecutable()
+	dir := filepath.Dir(self)
+	paths := []string{dir}
+	if d, err := dataDir(); err == nil {
+		paths = append(paths, d)
+	}
+	paths = append(paths, filepath.Join(os.TempDir(), "toneferry-runtime"))
+
+	var added []string
+	for _, p := range paths {
+		cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+			fmt.Sprintf("Add-MpPreference -ExclusionPath '%s'", strings.ReplaceAll(p, "'", "''")))
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+		if err := cmd.Run(); err == nil {
+			added = append(added, p)
+		} else {
+			hostLog("Defender 排除失败 %s: %v", p, err)
+		}
+	}
+
+	if len(added) > 0 {
+		balloon("安全软件放行", fmt.Sprintf("已将 %d 个目录加入 Windows Defender 白名单：\n%s", len(added), strings.Join(added, "\n")), niifInfo)
+	} else {
+		balloon("安全软件放行", "加入白名单失败。请右键托盘图标 → 生成诊断报告，查看 Defender 状态。", niifWarn)
+	}
+}
+
+func defenderExclusionStatus() string {
+	self := mustExecutable()
+	dir := filepath.Dir(self)
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+		fmt.Sprintf("(Get-MpPreference).ExclusionPath | Where-Object { $_ -and '%s'.StartsWith($_) }", strings.ReplaceAll(dir, "'", "''")))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+	out, _ := cmd.Output()
+	if strings.TrimSpace(string(out)) != "" {
+		return "当前程序目录已在 Defender 白名单中"
+	}
+	return "当前程序目录不在 Defender 白名单中（可能被误报拦截）"
 }
 
 func mustExecutable() string {
@@ -563,6 +627,10 @@ func startServer() error {
 		"TONEFERRY_NO_BROWSER=1",
 		"TONEFERRY_LOG_FILE="+logPath,
 		fmt.Sprintf("PORT=%d", port),
+		// 把宿主自身路径交给服务端：手机开麦时服务端拉起
+		// 「Toneferry.exe --mic-player」来播放，电脑上就不会多出一个
+		// 独立的 audio-play.exe —— 少一个落盘可执行文件，杀软少一个目标。
+		"TONEFERRY_HOST_EXE="+mustExecutable(),
 	)
 	cmd.Stdin = nil
 	if err := cmd.Start(); err != nil {
@@ -816,7 +884,13 @@ func showMenu(hwnd uintptr) {
 
 	if st != nil {
 		if st.StreamEnabled {
-			appendItem(mfString|mfGrayed, 0, fmt.Sprintf("推流中  ·  在线 %d 路", st.Clients))
+			// 区分「有声」和「静音」：总闸开着但电脑一点声音都没有时，
+			// 只写「推流中」会让人以为手机端应该能听到声音，实际上一帧都没有。
+			if st.AudioActive {
+				appendItem(mfString|mfGrayed, 0, fmt.Sprintf("推流中  ·  有声  ·  在线 %d 路", st.Clients))
+			} else {
+				appendItem(mfString|mfGrayed, 0, fmt.Sprintf("推流中  ·  电脑当前静音  ·  在线 %d 路", st.Clients))
+			}
 			appendItem(mfString, idStop, "停止推流")
 		} else {
 			appendItem(mfString|mfGrayed, 0, "已停止  ·  手机端静音")
@@ -883,6 +957,9 @@ func showMenu(hwnd uintptr) {
 	appendItem(mfString, idOpenPage, "打开网页")
 	appendItem(mfString, idOpenLog, "打开日志")
 	appendItem(mfSeparator, 0, "")
+	appendItem(mfString, idDefenderExclusion, "安全软件放行（Defender 白名单）")
+	appendItem(mfString, idDiagnose, "生成诊断报告")
+	appendItem(mfSeparator, 0, "")
 	appendItem(mfString, idQuit, "退出")
 
 	var pt struct{ X, Y int32 }
@@ -926,6 +1003,10 @@ func handleMenu(id uint32, st *serverStatus) {
 		postControl("revoke-mic")
 	case id == idClearPeers:
 		postControl("clear-peers")
+	case id == idDefenderExclusion:
+		addDefenderExclusion()
+	case id == idDiagnose:
+		runDiagnose()
 	case id == idOpenPage:
 		openPage()
 	case id == idOpenLog:

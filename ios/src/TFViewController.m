@@ -173,7 +173,7 @@ static NSString *const kLatencyKey = @"tf.latency";
     _versionLabel = [self labelWithSize:11 weight:UIFontWeightMedium
                                   color:[UIColor colorWithRed:0.35 green:0.41 blue:0.5 alpha:1.0]];
     _versionLabel.text = [NSString stringWithFormat:@"Toneferry for iOS  %@", [self versionText]];
-    _versionLabel.textAlignment = NSTextAlignmentRight;
+    _versionLabel.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:_versionLabel];
     NSLog(@"[tf] Toneferry iOS %@ 启动", [self versionText]);
 

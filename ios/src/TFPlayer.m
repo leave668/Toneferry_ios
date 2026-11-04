@@ -218,6 +218,8 @@ static OSStatus pipeRender(TFAudioPipe *p,
 - (void)sendJSON:(NSDictionary *)obj;
 - (void)sendMicBuffer:(AVAudioPCMBuffer *)buffer;
 - (void)setState:(TFPlayerState)state detail:(NSString *)detail;
+- (NSString *)playbackDetail;
+- (NSString *)bufferingDetail;
 @end
 
 @implementation TFPlayer {
@@ -228,6 +230,13 @@ static OSStatus pipeRender(TFAudioPipe *p,
     BOOL _connecting;
     /// 电脑网页端的总闸状态（false 时服务端不下发音频）
     BOOL _streamEnabled;
+    /// 是否收到过非静音帧。没收到过时界面要说「等电脑出声」，
+    /// 不能说「播放中」——那样用户只会以为 App 坏了。
+    BOOL _sawSound;
+    /// 最近一帧是否静音（电脑当前没有任何声音输出）
+    BOOL _frameSilent;
+    /// 最近一次上报给界面的状态文案，用于避免重复刷新
+    NSString *_lastDetail;
 
     // ---- 手机麦克风上行 ----
     /// 用户是否点了「麦克风」开关
@@ -635,8 +644,25 @@ static OSStatus pipeRender(TFAudioPipe *p,
 
 #pragma mark - 状态
 
+/**
+ * 播放状态文案。要把「链路正常但电脑没声音」和「链路正常且有声音」分开：
+ * WASAPI loopback 在电脑完全静音时一个字节都不给，服务端会补静音保活帧，
+ * 此时界面如果写「播放中」，用户听到没声音只会以为 App 坏了。
+ */
+- (NSString *)playbackDetail {
+    if (!_sawSound) return @"等待电脑端声音…";
+    if (_frameSilent) return @"播放中 · 电脑当前静音";
+    return @"播放中";
+}
+
+/// 还在预缓冲时的文案
+- (NSString *)bufferingDetail {
+    return _sawSound ? @"缓冲中…" : @"等待电脑端声音…";
+}
+
 - (void)setState:(TFPlayerState)state detail:(NSString *)detail {
     _state = state;
+    _lastDetail = detail;
     dispatch_async(dispatch_get_main_queue(), ^{
         id<TFPlayerDelegate> d = self.delegate;
         if ([d respondsToSelector:@selector(player:didChangeState:detail:)]) {
@@ -924,10 +950,16 @@ static OSStatus pipeRender(TFAudioPipe *p,
 
     // renderBlock 在实时线程，不能回调 delegate，所以「开始出声」在这里判定
     int32_t started = atomic_load_explicit(&_pipe->started, memory_order_relaxed);
-    if (started && _wantPlaying && _state != TFPlayerStatePlaying) {
-        [self setState:TFPlayerStatePlaying detail:@"播放中"];
-        [self updateNowPlayingWithLatency:totalMs backlog:backlogMs];
-        _lastNowPlayingUpdate = CACurrentMediaTime();
+    if (started && _wantPlaying) {
+        // 文案会随「电脑当前有没有声音」变化，需要能重复刷新同一状态
+        NSString *detail = [self playbackDetail];
+        if (_state != TFPlayerStatePlaying) {
+            [self setState:TFPlayerStatePlaying detail:detail];
+            [self updateNowPlayingWithLatency:totalMs backlog:backlogMs];
+            _lastNowPlayingUpdate = CACurrentMediaTime();
+        } else if (![_lastDetail isEqualToString:detail]) {
+            [self setState:TFPlayerStatePlaying detail:detail];
+        }
     }
 
     // 锁屏媒体卡片每秒刷一次，把实时延迟写进副标题。刷太快系统会丢弃。
@@ -1049,6 +1081,10 @@ static OSStatus pipeRender(TFAudioPipe *p,
             break;
         }
     }
+    // 静音帧也要记：电脑当前没有任何声音输出时，服务端会补静音保活帧，
+    // 界面必须据此说「等电脑出声」，而不是笼统的「播放中」。
+    _frameSilent = allZero;
+    if (!allZero) _sawSound = YES;
     if (!allZero && _lastPacket.length == data.length &&
         memcmp(_lastPacket.bytes, data.bytes, data.length) == 0) {
         _dupPackets++;
@@ -1076,7 +1112,7 @@ static OSStatus pipeRender(TFAudioPipe *p,
             return;
         }
         if (_pipe && !atomic_load_explicit(&_pipe->started, memory_order_relaxed)) {
-            [self setState:TFPlayerStateBuffering detail:@"缓冲中…"];
+            [self setState:TFPlayerStateBuffering detail:[self bufferingDetail]];
         }
     } else if ([type isEqualToString:@"stream-state"]) {
         // 电脑网页端的「开始收听」是总开关。没点时服务端一帧都不发，
@@ -1086,7 +1122,13 @@ static OSStatus pipeRender(TFAudioPipe *p,
             if (_pipe) pipeReset(_pipe);
             [self setState:TFPlayerStateBuffering detail:@"等待电脑端点击「开始收听」…"];
         } else if (_pipe && !atomic_load_explicit(&_pipe->started, memory_order_relaxed)) {
-            [self setState:TFPlayerStateBuffering detail:@"缓冲中…"];
+            [self setState:TFPlayerStateBuffering detail:[self bufferingDetail]];
+        }
+    } else if ([type isEqualToString:@"status"]) {
+        // 服务端还没启动采集器（按需落盘，只有真的推流才会释放采集程序）
+        NSString *m = msg[@"message"];
+        if ([m isEqualToString:@"capture config pending"]) {
+            [self setState:TFPlayerStateBuffering detail:@"等待电脑端开始推流…"];
         }
     } else if ([type isEqualToString:@"mic-state"]) {
         [self applyMicState:msg];

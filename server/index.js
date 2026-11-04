@@ -7,13 +7,13 @@ import { fileURLToPath } from 'node:url'
 import { spawn, exec } from 'node:child_process'
 import { WebSocketServer, WebSocket } from 'ws'
 import { createPeerStore } from './peers.js'
-import { createMicChannel, resolvePlayerPath, MIC_CHANNEL_ID, MIC_SAMPLE_RATE } from './mic.js'
+import { createMicChannel, resolvePlayer, MIC_CHANNEL_ID, MIC_SAMPLE_RATE } from './mic.js'
 
 /**
  * 服务端版本。pkg 打包成单文件后读不到 package.json，这里必须硬编码。
  * 升级时同步改 package.json / package-lock.json / ios/Info.plist 与本行。
  */
-const VERSION = '1.7.2'
+const VERSION = '1.7.3'
 
 /** Prefer LAN IPv4 (e.g. 192.168.x.x) for phone access on the same Wi‑Fi. */
 function getLanIPv4() {
@@ -81,8 +81,29 @@ function materializeCaptureExe(embeddedPath) {
 
 const ROOT = resolveRoot()
 const PUBLIC_DIR = path.join(ROOT, 'public')
-const CAPTURE_EXE = materializeCaptureExe(path.join(ROOT, 'bin', 'audio-capture.exe'))
-const PLAYER_EXE = materializeCaptureExe(path.join(ROOT, 'bin', 'audio-play.exe'))
+
+/**
+ * 采集器按需落盘。
+ *
+ * 为什么不能一开始就释放：audio-capture.exe 走的是 WASAPI loopback 录音接口，
+ * 杀毒软件普遍把「调用录音 API 的未知程序」当风险项处理。只用「手机当麦克风」
+ * 的用户压根不需要电脑端采集，却一样会被弹窗拦截。所以改成：只有真的开始推流
+ * 时，才把采集器写到磁盘并启动。
+ */
+let captureExePath = ''
+
+function ensureCaptureExe() {
+  if (captureExePath) return captureExePath
+  captureExePath = materializeCaptureExe(path.join(ROOT, 'bin', 'audio-capture.exe'))
+  return captureExePath
+}
+
+/**
+ * 播放器优先复用托盘宿主自身（Toneferry.exe --mic-player）。
+ * 手机开麦时电脑上就不会多出一个独立的 audio-play.exe ——
+ * 少一个落盘可执行文件，就少一个被杀毒软件盯上的目标。
+ */
+const PLAYER = resolvePlayer(ROOT, materializeCaptureExe)
 
 const HTTP_PORT = Number(process.env.PORT || 3088)
 const WS_PATH = '/audio'
@@ -119,7 +140,7 @@ if (LOG_FILE) {
 
 const peers = createPeerStore()
 const mic = createMicChannel({
-  playerPath: PLAYER_EXE,
+  player: PLAYER,
   log: (m) => console.log(`  ${c.dim}${m}${c.reset}`),
   onState: (s) => {
     broadcastJson({ type: 'mic-state', ...s })
@@ -223,6 +244,19 @@ function setStreamEnabled(on, owner) {
   const next = streamOwners.size > 0
   if (next === streamEnabled) return
   streamEnabled = next
+  // 开闸这一刻才真正需要采集器：按需落盘 + 启动，
+  // 只用「手机当麦克风」的场景下电脑上不会出现采集程序。
+  if (streamEnabled) {
+    if (!captureProc || captureProc.killed) {
+      captureProc = startCapture()
+    }
+  } else {
+    // 关闸时彻底杀掉采集进程：电脑上不留任何录音类可疑进程
+    if (captureProc && !captureProc.killed) {
+      captureProc.kill()
+      captureProc = null
+    }
+  }
   console.log(
     `  ${streamEnabled ? c.green : c.dim}[stream] 推流${streamEnabled ? '开启' : '停止'}` +
       `（订阅方 ${streamOwners.size} 路）${c.reset}`,
@@ -243,6 +277,49 @@ function broadcastBinary(buf) {
       /* 客户端已断开 */
     }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 静音保活                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 电脑当前没有任何声音输出时，WASAPI loopback 一个字节都不会给。
+ * 服务端如果就此沉默，手机端会永远停在「缓冲中…」，看起来就是
+ * 「连上了但没声音」，而托盘还写着「推流中」—— 三个界面各说各话。
+ *
+ * 这里在总闸打开、但采不到真帧时，按固定节拍补一段静音帧：
+ *   · 手机端能正常起播，界面如实显示「等待电脑端声音」
+ *   · 电脑一出声，真帧立刻接管，静音帧最多滞后 SILENCE_TICK_MS
+ */
+const SILENCE_TICK_MS = 250
+/** 最近一次收到真实采集帧的时刻（0 = 从来没收到过） */
+let lastAudioAt = 0
+/** 累计下发的真实音频帧数 */
+let audioFrames = 0
+let silenceFrameBuf = null
+
+function silenceFrame() {
+  const sr = audioConfig ? audioConfig.sampleRate : 48000
+  const ch = audioConfig ? audioConfig.channels : 2
+  const bytes = Math.max(Math.floor(sr * ch * 4 * 0.01), ch * 4)
+  if (!silenceFrameBuf || silenceFrameBuf.length !== bytes) {
+    silenceFrameBuf = Buffer.alloc(bytes)
+  }
+  return silenceFrameBuf
+}
+
+const silenceTimer = setInterval(() => {
+  if (!streamEnabled || !audioConfig) return
+  // 最近有真帧 → 说明电脑正在出声，不用补静音
+  if (Date.now() - lastAudioAt < SILENCE_TICK_MS * 2) return
+  broadcastBinary(silenceFrame())
+}, SILENCE_TICK_MS)
+silenceTimer.unref?.()
+
+/** 电脑当前有没有真的在出声（最近 500ms 内收到过非保活帧） */
+function audioActive() {
+  return lastAudioAt > 0 && Date.now() - lastAudioAt < 500
 }
 
 function broadcastJson(obj) {
@@ -421,6 +498,10 @@ function statusSnapshot() {
     url: `http://${host}:${HTTP_PORT}`,
     streamEnabled,
     captureRunning: !!captureProc,
+    // 电脑当前有没有真的在出声。托盘据此显示「有声」还是「静音」，
+    // 避免出现「托盘说推流中、手机说缓冲中」这种各说各话的状态。
+    audioActive: audioActive(),
+    audioFrames,
     mic: mic.state(),
     nativeCount: nativeClientCount(),
     clients: wss ? wss.clients.size : 0,
@@ -635,13 +716,16 @@ wsHeartbeat.unref?.()
 wss.on('close', () => clearInterval(wsHeartbeat))
 
 function startCapture() {
-  if (!fs.existsSync(CAPTURE_EXE)) {
-    console.error(`[error] missing capture binary: ${CAPTURE_EXE}`)
+  // 采集器是按需落盘的：此刻才真正把它写到磁盘并启动。
+  // 只用「手机当麦克风」的用户，电脑上从头到尾不会出现这个 exe。
+  const exe = ensureCaptureExe()
+  if (!fs.existsSync(exe)) {
+    console.error(`[error] missing capture binary: ${exe}`)
     console.error('Dev: npm run build:capture   |   Packaged: rebuild with npm run build:exe')
     holdAndExit(1)
   }
 
-  const child = spawn(CAPTURE_EXE, [], {
+  const child = spawn(exe, [], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   })
@@ -691,6 +775,9 @@ function startCapture() {
     while (pending.length >= frameBytes) {
       const frame = pending.subarray(0, frameBytes)
       pending = pending.subarray(frameBytes)
+      // 收到真帧 = 电脑当前正在出声
+      lastAudioAt = Date.now()
+      audioFrames += 1
       broadcastBinary(Buffer.from(frame))
     }
   })
@@ -698,7 +785,8 @@ function startCapture() {
   child.on('exit', (code, signal) => {
     console.error(`[capture] exited code=${code} signal=${signal}`)
     broadcastJson({ type: 'status', message: 'capture stopped' })
-    if (!shuttingDown) {
+    // 只有总闸还开着才重启；已经关闸就彻底停下，不再留下可疑进程
+    if (!shuttingDown && streamEnabled) {
       setTimeout(() => {
         captureProc = startCapture()
       }, 1500)
@@ -715,7 +803,9 @@ function startCapture() {
 let shuttingDown = false
 let captureProc = null
 
-captureProc = startCapture()
+// 采集器不随服务启动：只有真正开闸推流时才落盘 + 启动。
+// 这既解决了「电脑完全静音时手机永远缓冲中」的前置问题，
+// 也让只用「手机当麦克风」的用户电脑上不出现任何录音类可执行文件。
 
 server.listen(HTTP_PORT, '0.0.0.0', () => {
   const host = getLanIPv4()

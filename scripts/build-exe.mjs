@@ -128,7 +128,11 @@ async function main() {
   const captureExe = path.join(ROOT, 'bin', 'audio-capture.exe')
   const playerExe = path.join(ROOT, 'bin', 'audio-play.exe')
   mustExist(captureExe, 'Run: npm run build:capture')
-  mustExist(playerExe, 'Run: npm run build:player  (needs Go)')
+  // 播放器现在是可选的：正式版复用宿主 exe（--mic-player），
+  // 只在开发期需要独立的 audio-play.exe。缺了也不中断打包。
+  if (!fs.existsSync(playerExe)) {
+    console.warn('[warn] audio-play.exe 不存在，手机麦克风将复用宿主 exe（--mic-player）')
+  }
   mustExist(path.join(ROOT, 'public', 'index.html'), 'Missing public/index.html')
   const iconIco = path.join(ROOT, 'public', 'icon.ico')
   mustExist(iconIco, 'Missing public/icon.ico — generate app icon first')
@@ -143,7 +147,12 @@ async function main() {
   copyDir(path.join(ROOT, 'public'), path.join(BUILD_DIR, 'public'))
   ensureDir(path.join(BUILD_DIR, 'bin'))
   fs.copyFileSync(captureExe, path.join(BUILD_DIR, 'bin', 'audio-capture.exe'))
-  fs.copyFileSync(playerExe, path.join(BUILD_DIR, 'bin', 'audio-play.exe'))
+  // 给采集器补版本资源：没有 ProductName/FileDescription 的未签名 exe
+  // 是杀软启发式拦截的典型特征。补一个版本信息能显著降低误报率。
+  stampVersionOnCapture(path.join(BUILD_DIR, 'bin', 'audio-capture.exe'), iconIco)
+  if (fs.existsSync(playerExe)) {
+    fs.copyFileSync(playerExe, path.join(BUILD_DIR, 'bin', 'audio-play.exe'))
+  }
 
   console.log('[2/7] bundling server…')
   await esbuild.build({
@@ -317,6 +326,68 @@ function stampGoExe(exePath, iconPath) {
     fs.writeFileSync(exePath, Buffer.from(exe.generate()))
   } catch (err) {
     console.warn(`[warn] 回写托盘 exe 失败：${err.message}`)
+  }
+}
+
+/** 给采集器补版本资源，降低杀软启发式误报。 */
+function stampVersionOnCapture(exePath, iconPath) {
+  let exe, res
+  try {
+    exe = ResEdit.NtExecutable.from(fs.readFileSync(exePath), { ignoreCert: true })
+    res = ResEdit.NtExecutableResource.from(exe)
+  } catch (err) {
+    console.warn(`[warn] 无法解析采集器 exe，跳过版本资源：${err.message}`)
+    return
+  }
+
+  try {
+    const iconFile = ResEdit.Data.IconFile.from(fs.readFileSync(iconPath))
+    const icons = iconFile.icons.map((item) => item.data)
+    const groups = ResEdit.Resource.IconGroupEntry.fromEntries(res.entries)
+    if (groups.length === 0) {
+      ResEdit.Resource.IconGroupEntry.replaceIconsForResource(res.entries, 1, 1033, icons)
+    } else {
+      for (const group of groups) {
+        ResEdit.Resource.IconGroupEntry.replaceIconsForResource(res.entries, group.id, group.lang, icons)
+      }
+    }
+    console.log(`[icon] capture exe icon replaced (${groups.length || 1} group)`)
+  } catch (err) {
+    console.warn(`[warn] 采集器图标写入失败：${err.message}`)
+  }
+
+  try {
+    const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version
+    const parts = version.split('.').map((n) => parseInt(n, 10) || 0)
+    while (parts.length < 4) parts.push(0)
+
+    let vi = ResEdit.Resource.VersionInfo.fromEntries(res.entries)[0]
+    if (!vi) vi = ResEdit.Resource.VersionInfo.createEmpty()
+    vi.setFileVersion(parts[0], parts[1], parts[2], parts[3], 1033)
+    vi.setProductVersion(parts[0], parts[1], parts[2], parts[3], 1033)
+    vi.setStringValues(
+      { lang: 1033, codepage: 1200 },
+      {
+        FileDescription: 'Toneferry System Audio Capture',
+        ProductName: 'Toneferry',
+        OriginalFilename: 'audio-capture.exe',
+        InternalName: 'audio-capture',
+        CompanyName: 'Toneferry',
+        FileVersion: version,
+        ProductVersion: version,
+      },
+    )
+    vi.outputToResourceEntries(res.entries)
+    console.log(`[version] capture exe version → ${version}`)
+  } catch (err) {
+    console.warn(`[warn] 采集器版本资源写入失败：${err.message}`)
+  }
+
+  try {
+    res.outputResource(exe)
+    fs.writeFileSync(exePath, Buffer.from(exe.generate()))
+  } catch (err) {
+    console.warn(`[warn] 回写采集器 exe 失败：${err.message}`)
   }
 }
 

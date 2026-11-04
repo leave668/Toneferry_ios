@@ -1,7 +1,7 @@
 /**
  * 手机麦克风上行通道。
  *
- * 链路：手机（浏览器 / iOS App）采集 → WebSocket 二进制帧 → 本机 audio-play.exe
+ * 链路：手机（浏览器 / iOS App）采集 → WebSocket 二进制帧 → 电脑播放器
  *       → waveOut 渲染到默认输出设备 → 电脑扬声器/耳机出声。
  *
  * 安全模型：默认**不允许**。手机发起后必须由电脑端显式授权（托盘菜单 / 网页按钮），
@@ -22,7 +22,47 @@ export const MIC_CHANNELS = 1
 /** 上行积压超过这个量就整段丢弃：麦克风延迟比爆音更难受。 */
 const MAX_PENDING_BYTES = MIC_SAMPLE_RATE * 4 * 2 // 约 2 秒
 
-export function createMicChannel({ playerPath, log = () => {}, onState = () => {} }) {
+/**
+ * @typedef {{ cmd: string, args: string[] }} PlayerSpec
+ */
+
+/**
+ * 解析电脑端播放器。
+ *
+ * 优先复用托盘宿主自身（Toneferry.exe --mic-player）：手机开麦时电脑上
+ * 就不会多出一个独立的 audio-play.exe —— 少一个落盘可执行文件，
+ * 杀毒软件就少一个盯上的目标。
+ *
+ * 返回值可以是固定 spec，也可以是一个惰性求值函数：兜底路径需要把
+ * audio-play.exe 从 pkg 虚拟文件系统里落盘，这件事推迟到真正开麦时才做，
+ * 避免服务一启动就往 %TEMP% 里丢一个可执行文件。
+ *
+ * @param {string} rootDir
+ * @param {(p: string) => string} materialize
+ * @returns {PlayerSpec | (() => PlayerSpec)}
+ */
+export function resolvePlayer(rootDir, materialize = (p) => p) {
+  const hostExe = process.env.TONEFERRY_HOST_EXE
+  if (hostExe && fs.existsSync(hostExe)) {
+    return { cmd: hostExe, args: ['--mic-player'] }
+  }
+  return () => ({ cmd: materialize(path.join(rootDir, 'bin', 'audio-play.exe')), args: [] })
+}
+
+/**
+ * @param {PlayerSpec | (() => PlayerSpec) | undefined} player
+ * @returns {PlayerSpec}
+ */
+function playerSpec(player) {
+  if (typeof player === 'function') return player()
+  if (player && typeof player.cmd === 'string') {
+    return { cmd: player.cmd, args: Array.isArray(player.args) ? player.args : [] }
+  }
+  if (typeof player === 'string') return { cmd: player, args: [] }
+  return { cmd: '', args: [] }
+}
+
+export function createMicChannel({ player: playerSpecSource, log = () => {}, onState = () => {} }) {
   let granted = false
   /** @type {any} 当前真正在推麦克风的连接 */
   let owner = null
@@ -53,14 +93,15 @@ export function createMicChannel({ playerPath, log = () => {}, onState = () => {
   function ensurePlayer() {
     if (player) return player
     if (Date.now() < playerFailUntil) return null
-    if (!playerPath || !fs.existsSync(playerPath)) {
+    const spec = playerSpec(playerSpecSource)
+    if (!spec.cmd || !fs.existsSync(spec.cmd)) {
       lastPlayerError = '缺少播放器'
       playerFailUntil = Date.now() + PLAYER_RETRY_MS
-      log(`[mic] 缺少播放器：${playerPath || '(未配置)'}，手机麦克风将无声`)
+      log(`[mic] 缺少播放器：${spec.cmd || '(未配置)'}，手机麦克风将无声`)
       return null
     }
     try {
-      player = spawn(playerPath, [], { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true })
+      player = spawn(spec.cmd, spec.args, { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true })
     } catch (err) {
       lastPlayerError = err.message
       playerFailUntil = Date.now() + PLAYER_RETRY_MS
@@ -96,7 +137,6 @@ export function createMicChannel({ playerPath, log = () => {}, onState = () => {
     log('[mic] 播放器已启动（48000 Hz / 单声道 / Float32）')
     return player
   }
-
   function stopPlayer() {
     if (!player) return
     const p = player
@@ -232,8 +272,4 @@ export function createMicChannel({ playerPath, log = () => {}, onState = () => {
   }
 
   return api
-}
-
-export function resolvePlayerPath(rootDir) {
-  return path.join(rootDir, 'bin', 'audio-play.exe')
 }

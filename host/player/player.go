@@ -1,11 +1,15 @@
-// audio-play.exe —— 把 stdin 里的 Float32 单声道 PCM 播放到 Windows 默认输出设备。
+// Package player —— 把 Float32 单声道 PCM 播放到 Windows 默认输出设备。
 //
-// 为什么单独做一个进程：Node 没法直接调 waveOut/WASAPI，而手机麦克风的音频
-// 必须真的从电脑扬声器出来。服务端 spawn 本程序，把上行 PCM 写进 stdin 即可。
+// 为什么单独做成一个包：这份逻辑有两个使用方
+//   1. audio-play.exe（开发期 / 独立播放器）
+//   2. Toneferry.exe --mic-player（正式版：托盘宿主复用自身）
+//
+// 第 2 条是安全性的关键：正式版里手机开麦时，电脑上不会出现第二个
+// 落盘可执行文件。杀毒软件判定风险时，可疑目标越少越不容易被拦。
 //
 // 输入格式固定：48000 Hz / 1 声道 / float32 小端（与 server/mic.js 约定一致）。
 // 输出：waveOut（winmm），8 个 20ms 缓冲轮转，端到端延迟约 40~80ms。
-package main
+package player
 
 import (
 	"encoding/binary"
@@ -15,7 +19,7 @@ import (
 	"os"
 	"syscall"
 	"time"
-	"unsafe"
+	unsafe "unsafe"
 )
 
 const (
@@ -72,10 +76,11 @@ type buffer struct {
 	busy bool
 }
 
-func main() {
+// Run 从 r 读取 PCM 并播放到默认输出设备，直到 r 读到 EOF。
+// 出错时返回可读的错误描述，调用方决定是退出还是打印。
+func Run(r io.Reader) error {
 	if n, _, _ := procWaveOutGetNumDev.Call(); n == 0 {
-		fmt.Fprintln(os.Stderr, "没有可用的音频输出设备")
-		os.Exit(2)
+		return fmt.Errorf("没有可用的音频输出设备")
 	}
 
 	frameBytes := channels * bitsPerSamp / 8
@@ -90,15 +95,14 @@ func main() {
 	wf.BitsPerSample = bitsPerSamp
 
 	var handle uintptr
-	r, _, _ := procWaveOutOpen.Call(
+	res, _, _ := procWaveOutOpen.Call(
 		uintptr(unsafe.Pointer(&handle)),
 		waveMapper,
 		uintptr(unsafe.Pointer(&wf)),
 		0, 0, 0,
 	)
-	if r != 0 || handle == 0 {
-		fmt.Fprintf(os.Stderr, "waveOutOpen 失败 code=%d\n", r)
-		os.Exit(3)
+	if res != 0 || handle == 0 {
+		return fmt.Errorf("waveOutOpen 失败 code=%d", res)
 	}
 	defer procWaveOutClose.Call(handle)
 
@@ -109,8 +113,7 @@ func main() {
 		b.hdr.Data = uintptr(unsafe.Pointer(&b.data[0]))
 		b.hdr.BufferLength = uint32(bufSize)
 		if pr, _, _ := procWaveOutPrepare.Call(handle, uintptr(unsafe.Pointer(&b.hdr)), hdrSize); pr != 0 {
-			fmt.Fprintf(os.Stderr, "waveOutPrepareHeader 失败 code=%d\n", pr)
-			os.Exit(4)
+			return fmt.Errorf("waveOutPrepareHeader 失败 code=%d", pr)
 		}
 		bufs[i] = b
 	}
@@ -128,7 +131,7 @@ func main() {
 
 		eof := false
 		for len(pending) < bufSize {
-			n, rerr := os.Stdin.Read(readBuf)
+			n, rerr := r.Read(readBuf)
 			if n > 0 {
 				pending = append(pending, readBuf[:n]...)
 			}
@@ -137,16 +140,14 @@ func main() {
 					eof = true
 					break
 				}
-				fmt.Fprintf(os.Stderr, "读 stdin 失败: %v\n", rerr)
-				eof = true
-				break
+				return fmt.Errorf("读 PCM 失败: %v", rerr)
 			}
 		}
 
 		if len(pending) == 0 && eof {
 			drain(bufs)
 			procWaveOutReset.Call(handle)
-			return
+			return nil
 		}
 
 		// 尾部不足一块时补零，保证 waveOutWrite 拿到整块，避免爆音
@@ -167,7 +168,7 @@ func main() {
 
 		if eof && len(pending) == 0 {
 			drain(bufs)
-			return
+			return nil
 		}
 	}
 }
