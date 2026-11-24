@@ -128,10 +128,10 @@ async function main() {
   const captureExe = path.join(ROOT, 'bin', 'audio-capture.exe')
   const playerExe = path.join(ROOT, 'bin', 'audio-play.exe')
   mustExist(captureExe, 'Run: npm run build:capture')
-  // 播放器现在是可选的：正式版复用宿主 exe（--mic-player），
-  // 只在开发期需要独立的 audio-play.exe。缺了也不中断打包。
+  // audio-play.exe 是可选的历史遗留文件：麦克风功能已移除，
+  // 缺了也不影响打包与收听主链路。
   if (!fs.existsSync(playerExe)) {
-    console.warn('[warn] audio-play.exe 不存在，手机麦克风将复用宿主 exe（--mic-player）')
+    console.warn('[warn] audio-play.exe 不存在（麦克风已移除，可忽略）')
   }
   mustExist(path.join(ROOT, 'public', 'index.html'), 'Missing public/index.html')
   const iconIco = path.join(ROOT, 'public', 'icon.ico')

@@ -18,11 +18,11 @@ const channelsEl = document.getElementById('channels')
 const bufferedEl = document.getElementById('buffered')
 const levelEl = document.getElementById('level')
 
-/* 手机麦克风 / 最近连接 */
-const micBadge = document.getElementById('micBadge')
-const micHint = document.getElementById('micHint')
-const btnMic = document.getElementById('btnMic')
-const btnMicGrant = document.getElementById('btnMicGrant')
+/* 关闭网页 / 最近连接 */
+/** 本页是否跑在电脑上（只有本机页面显示「关闭网页」） */
+let isLocalPage = false
+const btnClosePage = document.getElementById('btnClosePage')
+const closePageHint = document.getElementById('closePageHint')
 const peersList = document.getElementById('peersList')
 const peersBadge = document.getElementById('peersBadge')
 
@@ -610,12 +610,6 @@ function connectWs() {
         applyAudioConfig(msg)
       } else if (msg.type === 'peer-mode') {
         applyPeerMode(Number(msg.nativeCount) || 0)
-      } else if (msg.type === 'mic-state') {
-        applyMicState(msg)
-      } else if (msg.type === 'mic-request') {
-        micPending = true
-        setMicUI()
-        refreshPeers()
       } else if (msg.type === 'stream-state') {
         // 只处理「确认开闸之后又被关掉」的情况（另一个标签页点了停止）。
         // 刚连上时服务端会先发一次 enabled:false，那是初始态，不能当成停止。
@@ -961,260 +955,37 @@ window.addEventListener('online', () => {
  * 或在电脑 Chrome 远程调试里查看。锁屏无声时先看 sinkHasStream / audioContext。
  */
 /* ------------------------------------------------------------------ */
-/* 手机麦克风 → 电脑                                                   */
+/* 关闭网页（电脑本机）：关页面不停推流，程序留在托盘，手机继续收听      */
 /* ------------------------------------------------------------------ */
 
 /**
- * 链路：getUserMedia → AudioWorklet（重采样到 48k 单声道 f32）→ WebSocket 二进制帧
- *       → 电脑端 audio-play.exe → 扬声器。
- * 授权：默认关闭，必须在电脑端（托盘菜单或本页按钮）授权一次。
+ * 关掉电脑上的网页，但不停止推流：
+ * 1. 先把推流闸的所有权转给服务端持久哨兵（start 走 API_OWNER），
+ *    这样本页 WebSocket 断开时不会触发关闸 —— 手机还能继续收听。
+ * 2. 再尝试 window.close()。浏览器通常只允许脚本关闭自己打开的窗口，
+ *    手动输入地址打开的标签关不掉，此时给出明确提示。
  */
-
-/** 上行帧头：4 字节小端通道号，1 = 麦克风；后面才是 f32 PCM（4 字节对齐） */
-const MIC_CHANNEL = 1
-const MIC_FRAME_SAMPLES = 960 // 20ms @48k
-
-/** 本页是否跑在电脑上（只有电脑能授权，手机页面只负责开麦） */
-let isLocalPage = false
-/** 用户意图：想让手机当麦克风 */
-let micWanted = false
-/** 服务端当前是否已授权 */
-let micGranted = false
-let micPending = false
-/** @type {MediaStream | null} */
-let micStream = null
-/** @type {AudioContext | null} */
-let micCtx = null
-/** @type {AudioWorkletNode | null} */
-let micNode = null
-let micSink = null
-let micFrames = 0
-/** 采集正在建立中：防止并发建多个 AudioContext（会把 worklet 全局作用域搞乱） */
-let micStarting = false
-
-// 采集 worklet 放在独立文件 public/mic-worklet.js 里加载。
-// 不要改回内联 Blob URL：并发调用时多个 AudioContext 抢同一个 blob 会抛
-// "AudioWorklet does not have a valid AudioWorkletGlobalScope"。
-
-function setMicUI() {
-  if (!micBadge) return
-  if (micGranted && micWanted) {
-    micBadge.textContent = '使用中'
-    micBadge.className = 'tf-badge on'
-    btnMic.textContent = '关闭麦克风'
-    micHint.textContent = '正在把手机麦克风的声音送到电脑扬声器。'
-  } else if (micPending) {
-    micBadge.textContent = '等待授权'
-    micBadge.className = 'tf-badge warn'
-    btnMic.textContent = '取消'
-    micHint.textContent = isLocalPage
-      ? '有手机请求开麦，点右边「授权」后才会真正出声。'
-      : '已向电脑发送请求，请在电脑的托盘图标或网页上点「授权」。'
-  } else if (micGranted) {
-    micBadge.textContent = '已授权'
-    micBadge.className = 'tf-badge on'
-    btnMic.textContent = '开启麦克风'
-    micHint.textContent = '电脑已授权，点一下就能开始说话。'
-  } else {
-    micBadge.textContent = '未开启'
-    micBadge.className = 'tf-badge'
-    btnMic.textContent = '开启麦克风'
-    micHint.textContent =
-      '手机说话，电脑扬声器出声。出于安全，必须在电脑端手动授权一次才会真正开麦。'
-  }
-  if (btnMicGrant) btnMicGrant.hidden = !(isLocalPage && micPending)
-}
-
-async function ensureMicWorklet(ctx) {
-  // 独立文件，直接走同源路径。每次 addModule 都是幂等的，
-  // 但必须 await 完成后再 new AudioWorkletNode。
-  await ctx.audioWorklet.addModule('./mic-worklet.js')
-}
-
-function sendMicFrame(f32) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return
-  if (!micGranted) return
-  const buf = new ArrayBuffer(4 + f32.length * 4)
-  new DataView(buf).setUint32(0, MIC_CHANNEL, true)
-  new Float32Array(buf, 4).set(f32)
+async function closePage() {
   try {
-    ws.send(buf)
-    micFrames += 1
+    await control('start')
+  } catch {
+    /* 即便控制请求失败也继续尝试关闭，不能把用户卡在页面上 */
+  }
+  if (closePageHint) closePageHint.hidden = false
+  setStatus('已请求关闭网页，程序在右下角托盘继续运行，手机可继续收听')
+  try {
+    window.close()
   } catch {
     /* ignore */
   }
+  // window.close() 被浏览器忽略时（非脚本打开的标签），1.2s 后仍停留则提示手动关
+  setTimeout(() => {
+    setStatus('请手动关闭此标签页；程序在右下角托盘运行，手机可继续收听')
+  }, 1200)
 }
 
-async function startMicCapture() {
-  // 防重入是必须的：refreshLocalFlag 每 8 秒会调一次 applyMicState，
-  // 采集还没建好时 micStream 仍是 null，会被反复触发，多个 AudioContext
-  // 互相覆盖全局 micCtx，最终报
-  // "AudioWorklet does not have a valid AudioWorkletGlobalScope"。
-  if (micStream || micStarting) return
-  micStarting = true
-
-  let stream = null
-  let ctx = null
-  try {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      micHint.textContent = '当前浏览器不支持麦克风采集（需要 HTTPS 或 localhost）。'
-      micWanted = false
-      setMicUI()
-      return
-    }
-
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    })
-
-    ctx = new AudioContext({ sampleRate: 48000 })
-    if (ctx.state === 'suspended') await ctx.resume()
-    await ensureMicWorklet(ctx)
-
-    // 一定要用局部 ctx / node 构造，不能读写全局变量：
-    // 并发时全局变量可能已被另一个 context 覆盖。
-    const node = new AudioWorkletNode(ctx, 'tf-mic')
-    node.port.onmessage = (ev) => sendMicFrame(ev.data)
-
-    const src = ctx.createMediaStreamSource(stream)
-    src.connect(node)
-
-    // AudioWorkletNode 只有连到 destination 才会被驱动；用 0 增益避免自己外放
-    const sink = ctx.createGain()
-    sink.gain.value = 0
-    node.connect(sink)
-    sink.connect(ctx.destination)
-
-    // 全部成功后再一次性提交到全局状态
-    micStream = stream
-    micCtx = ctx
-    micNode = node
-    micSink = sink
-  } catch (err) {
-    // 失败必须把半成品清干净，否则下次点击会卡在 micStarting 或残留 track
-    try {
-      if (stream) for (const t of stream.getTracks()) t.stop()
-    } catch {
-      /* ignore */
-    }
-    if (ctx) {
-      try {
-        await ctx.close()
-      } catch {
-        /* ignore */
-      }
-    }
-    micHint.textContent = `麦克风启动失败：${(err && err.message) || err}`
-  } finally {
-    micStarting = false
-  }
-}
-
-async function stopMicCapture() {
-  if (micNode) {
-    try {
-      micNode.port.onmessage = null
-      micNode.disconnect()
-    } catch {
-      /* ignore */
-    }
-    micNode = null
-  }
-  if (micSink) {
-    try {
-      micSink.disconnect()
-    } catch {
-      /* ignore */
-    }
-    micSink = null
-  }
-  if (micStream) {
-    for (const t of micStream.getTracks()) t.stop()
-    micStream = null
-  }
-  if (micCtx) {
-    try {
-      await micCtx.close()
-    } catch {
-      /* ignore */
-    }
-    micCtx = null
-  }
-}
-
-async function toggleMic() {
-  // 电脑本机页面上的「关闭麦克风」= 撤销授权，跨端生效。
-  // 否则手机端还在往上推，电脑这边只是自己不听，用户会觉得「点了关闭却没关掉」。
-  if (isLocalPage && micGranted) {
-    await control('revoke-mic')
-    micWanted = false
-    await stopMicCapture()
-    micGranted = false
-    micPending = false
-    setMicUI()
-    return
-  }
-
-  if (micWanted) {
-    micWanted = false
-    await stopMicCapture()
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'mic-close' }))
-    }
-    micGranted = false
-    micPending = false
-    setMicUI()
-    return
-  }
-
-  micWanted = true
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    micHint.textContent = '请先点「开始收听」建立连接，再开麦克风。'
-    micWanted = false
-    setMicUI()
-    return
-  }
-  ws.send(JSON.stringify({ type: 'mic-open' }))
-  setMicUI()
-}
-
-function applyMicState(msg) {
-  micGranted = !!msg.granted
-  micPending = !!msg.pending
-
-  // 授权被撤销/拒绝：正在采集就立刻停掉，并把本地意图复位。
-  // 只在「确实在采集」时复位，避免服务端初始状态把用户的点击意图冲掉。
-  if (!micGranted && !micPending && micWanted && (micStream || micStarting)) {
-    micWanted = false
-    stopMicCapture().catch(() => {})
-  }
-
-  setMicUI()
-
-  // 只要「想开麦 + 已授权 + 还没在采集」就启动。
-  // 不能只判 !wasGranted：用户可能先点电脑端「授权」再点手机「麦克风」，
-  // 那种顺序下 micGranted 从始至终是 true，会永远不启动采集。
-  if (micWanted && micGranted && !micStream && !micStarting) {
-    startMicCapture().catch((e) => {
-      micHint.textContent = `麦克风启动失败：${e.message || e}`
-    })
-  }
-  if (!micGranted && micStream) {
-    stopMicCapture().catch(() => {})
-  }
-}
-
-btnMic?.addEventListener('click', () => {
-  toggleMic().catch(console.error)
-})
-
-btnMicGrant?.addEventListener('click', () => {
-  control('grant-mic').catch(console.error)
+btnClosePage?.addEventListener('click', () => {
+  closePage().catch(console.error)
 })
 
 /* ------------------------------------------------------------------ */
@@ -1229,7 +1000,6 @@ async function control(action) {
       body: JSON.stringify({ action }),
     })
     const j = await r.json()
-    if (j && j.mic) applyMicState(j.mic)
     if (j && typeof j.streamEnabled === 'boolean') {
       // 托盘那边点了开始/停止，同步一下按钮状态
       if (j.streamEnabled && !listening) {
@@ -1286,16 +1056,16 @@ async function refreshLocalFlag() {
     const r = await fetch('/api/status', { cache: 'no-store' })
     const j = await r.json()
     isLocalPage = !!j.local
-    if (j.mic) applyMicState(j.mic)
-    setMicUI()
+    // 「关闭网页」只对电脑本机页面有意义：手机页面关掉就没法收听了。
+    if (btnClosePage) btnClosePage.hidden = !isLocalPage
   } catch {
-    // 保持上一次的判断：网络抖一下不该让「授权」按钮闪没
+    // 保持上一次的判断：网络抖一下不该让按钮闪没
   }
 }
 
 refreshLocalFlag()
 refreshPeers()
-// 页面加载时服务端可能还没起来，本地标记要持续刷新，否则授权按钮永远不出现
+// 页面加载时服务端可能还没起来，本地标记要持续刷新，否则关闭网页按钮永远不出现
 setInterval(refreshLocalFlag, 8000)
 setInterval(refreshPeers, 8000)
 

@@ -3,8 +3,7 @@
 // 职责：
 //  1. 以 GUI 子系统启动（双击不弹 cmd 黑框）
 //  2. 把内嵌的 ToneferryServer.exe 释放到 %LOCALAPPDATA%\Toneferry\ 并隐藏启动
-//  3. 托盘图标 + 右键菜单（开始/停止推送、授权手机麦克风、最近连接、打开网页、退出）
-//  4. 手机请求麦克风时弹气泡提醒，等用户点「授权」
+//  3. 托盘图标 + 右键菜单（开始/停止推送、最近连接、打开网页、退出）
 //
 // 与服务端之间只走本地 HTTP（/api/status、/api/control），不共享内存，互不影响。
 package main
@@ -29,8 +28,6 @@ import (
 	"syscall"
 	"time"
 	unsafe "unsafe"
-
-	"toneferry/player"
 )
 
 //go:embed assets
@@ -88,9 +85,6 @@ const (
 const (
 	idStart = 1001 + iota
 	idStop
-	idGrantMic
-	idDenyMic
-	idRevokeMic
 	idOpenPage
 	idOpenLog
 	idClearPeers
@@ -100,14 +94,6 @@ const (
 )
 
 const idPeerBase = 2000
-
-type micState struct {
-	Granted     bool   `json:"granted"`
-	Active      bool   `json:"active"`
-	Pending     bool   `json:"pending"`
-	PendingIP   string `json:"pendingIp"`
-	PlayerReady bool   `json:"playerReady"`
-}
 
 type peerInfo struct {
 	IP       string `json:"ip"`
@@ -129,7 +115,6 @@ type serverStatus struct {
 	// 必须区分「有声 / 静音」两种状态。
 	AudioActive  bool       `json:"audioActive"`
 	AudioFrames  int64      `json:"audioFrames"`
-	Mic          micState   `json:"mic"`
 	NativeCount  int        `json:"nativeCount"`
 	Clients      int        `json:"clients"`
 	Peers        []peerInfo `json:"peers"`
@@ -200,7 +185,6 @@ var (
 	hwndMain    uintptr
 	port        = 3088
 	dataRoot    string
-	micPrompted bool
 )
 
 func main() {
@@ -208,18 +192,6 @@ func main() {
 
 	if len(os.Args) > 1 && (os.Args[1] == "--diagnose" || os.Args[1] == "/diagnose") {
 		runDiagnose()
-		return
-	}
-
-	// 播放器模式：把 stdin 的 PCM 播到默认输出设备。
-	// 服务端在手机开麦时拉起这个子进程 —— 复用宿主自身，
-	// 电脑上就不会多出一个独立的 audio-play.exe（少一个杀软盯上的目标）。
-	// 必须在单实例互斥体之前判断：这个子进程不是托盘实例。
-	if len(os.Args) > 1 && (os.Args[1] == "--mic-player" || os.Args[1] == "/mic-player") {
-		if err := player.Run(os.Stdin); err != nil {
-			fmt.Fprintln(os.Stderr, err.Error())
-			os.Exit(1)
-		}
 		return
 	}
 
@@ -627,10 +599,6 @@ func startServer() error {
 		"TONEFERRY_NO_BROWSER=1",
 		"TONEFERRY_LOG_FILE="+logPath,
 		fmt.Sprintf("PORT=%d", port),
-		// 把宿主自身路径交给服务端：手机开麦时服务端拉起
-		// 「Toneferry.exe --mic-player」来播放，电脑上就不会多出一个
-		// 独立的 audio-play.exe —— 少一个落盘可执行文件，杀软少一个目标。
-		"TONEFERRY_HOST_EXE="+mustExecutable(),
 	)
 	cmd.Stdin = nil
 	if err := cmd.Start(); err != nil {
@@ -902,32 +870,6 @@ func showMenu(hwnd uintptr) {
 
 	appendItem(mfSeparator, 0, "")
 
-	// 麦克风授权
-	if st != nil {
-		if st.Mic.Granted {
-			label := "允许手机使用麦克风（点击撤销）"
-			if st.Mic.Active {
-				label = "手机麦克风使用中（点击撤销）"
-			} else if st.Mic.Pending {
-				label = "允许手机使用麦克风（有待确认请求）"
-			}
-			appendItem(mfString|mfChecked, idRevokeMic, label)
-		} else {
-			label := "授权手机麦克风"
-			if st.Mic.Pending {
-				label = "★ 授权手机麦克风（" + orDefault(st.Mic.PendingIP, "手机") + " 正在请求）"
-			}
-			appendItem(mfString, idGrantMic, label)
-			if st.Mic.Pending {
-				appendItem(mfString, idDenyMic, "拒绝本次请求")
-			}
-		}
-	} else {
-		appendItem(mfString|mfGrayed, idGrantMic, "授权手机麦克风")
-	}
-
-	appendItem(mfSeparator, 0, "")
-
 	// 最近连接
 	peersMenu, _, _ := pCreatePopupMenu.Call()
 	peerCount := 0
@@ -992,15 +934,6 @@ func handleMenu(id uint32, st *serverStatus) {
 		postControl("start")
 	case id == idStop:
 		postControl("stop")
-	case id == idGrantMic:
-		postControl("grant-mic")
-		mu.Lock()
-		micPrompted = true
-		mu.Unlock()
-	case id == idDenyMic:
-		postControl("deny-mic")
-	case id == idRevokeMic:
-		postControl("revoke-mic")
 	case id == idClearPeers:
 		postControl("clear-peers")
 	case id == idDefenderExclusion:
@@ -1047,23 +980,9 @@ func pollLoop() {
 			var st serverStatus
 			if json.Unmarshal(body, &st) == nil {
 				mu.Lock()
-				prev := status
 				status = &st
 				lastErr = ""
-				shouldPrompt := st.Mic.Pending && (prev == nil || !prev.Mic.Pending) && !micPrompted
-				if shouldPrompt {
-					micPrompted = true
-				}
 				mu.Unlock()
-				if shouldPrompt {
-					ip := orDefault(st.Mic.PendingIP, "手机")
-					balloon("麦克风授权请求", ip+" 想使用电脑播放手机麦克风，右键托盘图标点「授权手机麦克风」。", niifWarn)
-				}
-				if prev != nil && prev.Mic.Pending && !st.Mic.Pending {
-					mu.Lock()
-					micPrompted = false
-					mu.Unlock()
-				}
 			}
 		}
 		time.Sleep(1500 * time.Millisecond)

@@ -7,13 +7,12 @@ import { fileURLToPath } from 'node:url'
 import { spawn, exec } from 'node:child_process'
 import { WebSocketServer, WebSocket } from 'ws'
 import { createPeerStore } from './peers.js'
-import { createMicChannel, resolvePlayer, MIC_CHANNEL_ID, MIC_SAMPLE_RATE } from './mic.js'
 
 /**
  * 服务端版本。pkg 打包成单文件后读不到 package.json，这里必须硬编码。
  * 升级时同步改 package.json / package-lock.json / ios/Info.plist 与本行。
  */
-const VERSION = '1.7.3'
+const VERSION = '1.7.4'
 
 /** Prefer LAN IPv4 (e.g. 192.168.x.x) for phone access on the same Wi‑Fi. */
 function getLanIPv4() {
@@ -98,13 +97,6 @@ function ensureCaptureExe() {
   return captureExePath
 }
 
-/**
- * 播放器优先复用托盘宿主自身（Toneferry.exe --mic-player）。
- * 手机开麦时电脑上就不会多出一个独立的 audio-play.exe ——
- * 少一个落盘可执行文件，就少一个被杀毒软件盯上的目标。
- */
-const PLAYER = resolvePlayer(ROOT, materializeCaptureExe)
-
 const HTTP_PORT = Number(process.env.PORT || 3088)
 const WS_PATH = '/audio'
 const OPEN_BROWSER = process.env.TONEFERRY_NO_BROWSER !== '1'
@@ -139,18 +131,6 @@ if (LOG_FILE) {
 }
 
 const peers = createPeerStore()
-const mic = createMicChannel({
-  player: PLAYER,
-  log: (m) => console.log(`  ${c.dim}${m}${c.reset}`),
-  onState: (s) => {
-    broadcastJson({ type: 'mic-state', ...s })
-    // 手机请求开麦 → 通知所有电脑端（浏览器 + 托盘轮询）来授权
-    if (s.pending) {
-      broadcastJson({ type: 'mic-request', ip: s.pendingIp })
-      console.log(`  ${c.yellow}[mic] ${s.pendingIp || '手机'} 请求使用麦克风，等待电脑端授权${c.reset}`)
-    }
-  },
-})
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
@@ -400,7 +380,7 @@ function printStartupBanner(host, port) {
   const trayMode = !process.stdout.isTTY
   console.log(
     trayMode
-      ? `    · 程序在${c.yellow}任务栏右下角托盘${c.reset}，右键图标可授权麦克风 / 查看最近 IP / 退出`
+      ? `    · 程序在${c.yellow}任务栏右下角托盘${c.reset}，关闭电脑网页不影响手机收听；右键图标可查看最近 IP / 退出`
       : `    · 请保持本窗口开着，${c.yellow}关闭窗口即停止服务${c.reset}`,
   )
   console.log(`    · ${c.yellow}请将音频输出设备设为主机自带扬声器${c.reset}（系统声音 → 输出），勿选 USB 声卡 / 耳机等外置设备`)
@@ -502,7 +482,6 @@ function statusSnapshot() {
     // 避免出现「托盘说推流中、手机说缓冲中」这种各说各话的状态。
     audioActive: audioActive(),
     audioFrames,
-    mic: mic.state(),
     nativeCount: nativeClientCount(),
     clients: wss ? wss.clients.size : 0,
     peers: peers.list(),
@@ -536,15 +515,6 @@ async function handleApi(req, res, urlPath) {
         break
       case 'stop':
         setStreamEnabled(false)
-        break
-      case 'grant-mic':
-        mic.grant()
-        break
-      case 'deny-mic':
-        mic.deny()
-        break
-      case 'revoke-mic':
-        mic.revoke()
         break
       case 'clear-peers':
         peers.clear()
@@ -629,14 +599,8 @@ wss.on('connection', (ws, req) => {
   broadcastPeerMode();
 
   ws.on('message', (data, isBinary) => {
-    // 上行音频：前 4 字节小端通道号（1 = 麦克风），后面是 f32 PCM
-    if (isBinary) {
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data)
-      if (buf.length > 4 && buf.readUInt32LE(0) === MIC_CHANNEL_ID) {
-        mic.write(ws, buf.subarray(4))
-      }
-      return
-    }
+    // 本工具只有下行音频（电脑 → 手机），不接收上行二进制帧
+    if (isBinary) return
     const text = typeof data === 'string' ? data : data.toString('utf8')
     try {
       const msg = JSON.parse(text)
@@ -660,13 +624,6 @@ wss.on('connection', (ws, req) => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'stream-state', enabled: streamEnabled }))
         }
-      } else if (msg.type === 'mic-open') {
-        const r = mic.open(ws)
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'mic-state', ...mic.state(), ...r }))
-        }
-      } else if (msg.type === 'mic-close') {
-        mic.close(ws)
       } else if (msg.type === 'ping') {
         // 客户端心跳：锁屏时用它维持连接并确认下行仍通畅
         if (ws.readyState === WebSocket.OPEN) {
@@ -681,7 +638,6 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     const left = Math.max(wss.clients.size - 1, 0)
     console.log(`  ${c.dim}[ws] ${who} 断开（剩余 ${left} 路）${c.reset}`)
-    mic.detach(ws)
     // 发起推流的页面关掉后必须关闸，否则采集继续空转、手机继续收
     if (streamOwners.delete(ws)) setStreamEnabled(streamOwners.size > 0)
     // close 事件里 clients 集合可能还没更新完，挪到下一轮事件循环再算
@@ -847,11 +803,6 @@ function shutdown() {
   if (shuttingDown) return
   shuttingDown = true
   console.log('shutting down...')
-  try {
-    mic.shutdown()
-  } catch {
-    /* ignore */
-  }
   if (captureProc && !captureProc.killed) {
     captureProc.kill()
   }
