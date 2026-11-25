@@ -2,17 +2,29 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { spawn, exec } from 'node:child_process'
 import { WebSocketServer, WebSocket } from 'ws'
 import { createPeerStore } from './peers.js'
+// 配对码鉴权逻辑与测试脚本共用同一份实现（server/pairing.js）。
+import { normalizePin, allowHandshake } from './pairing.js'
 
 /**
  * 服务端版本。pkg 打包成单文件后读不到 package.json，这里必须硬编码。
  * 升级时同步改 package.json / package-lock.json / ios/Info.plist 与本行。
  */
-const VERSION = '1.7.4'
+const VERSION = '1.7.5'
+
+/**
+ * 配对码：局域网设备接入的凭据。
+ * 来源优先级：
+ *   1) TONEFERRY_PIN 环境变量 —— 托盘宿主生成并持久化，重启不变；
+ *   2) 随机 6 位数字 —— 直接 `node server/index.js` 开发运行时每次重置。
+ * 归一化与握手判断复用 server/pairing.js（测试脚本用同一份实现）。
+ */
+const PAIR_PIN = normalizePin(process.env.TONEFERRY_PIN) || String(crypto.randomInt(100000, 1000000))
 
 /** Prefer LAN IPv4 (e.g. 192.168.x.x) for phone access on the same Wi‑Fi. */
 function getLanIPv4() {
@@ -368,11 +380,15 @@ function printStartupBanner(host, port) {
   console.log(`    本机浏览器：              ${c.dim}${localUrl}${c.reset}`)
   console.log(`    WebSocket：               ${c.dim}${wsUrl}${c.reset}`)
   console.log('')
+  console.log(`  ${c.green}${c.bold}配对码${c.reset}（手机首次连接需在页面输入）\n`)
+  console.log(`    ${c.yellow}${c.bold}${PAIR_PIN}${c.reset}  ${c.dim}本机网页与托盘图标上也能看到${c.reset}`)
+  console.log('')
   console.log(`  ${c.green}${c.bold}如何使用${c.reset}\n`)
   console.log(`    1. 电脑播放音乐 / 视频 / 浏览器声音`)
   console.log(`    2. 手机与电脑在 ${c.bold}同一局域网${c.reset}`)
-  console.log(`    3. 手机浏览器打开上面的局域网地址`)
+  console.log(`    3. 手机浏览器打开上面的局域网地址，输入配对码 ${c.bold}${PAIR_PIN}${c.reset}`)
   console.log(`    4. 点击页面「开始收听」`)
+  console.log(`    5. 同一局域网其他设备没有配对码将无法接入`)
   console.log('')
   console.log(`  ${c.magenta}${c.bold}注意事项${c.reset}\n`)
   // 托盘模式下没有控制台窗口，原来「关闭本窗口即停止服务」的说法会让人以为
@@ -492,7 +508,12 @@ async function handleApi(req, res, urlPath) {
   const method = (req.method || 'GET').toUpperCase()
 
   if (urlPath === '/api/status' && method === 'GET') {
-    sendJson(res, 200, { ...statusSnapshot(), local: isLoopback(req) })
+    const local = isLoopback(req)
+    const snap = statusSnapshot()
+    // 配对码只对本机可见，绝不能让局域网设备从公开接口读到，否则形同虚设。
+    // 手机端要输入配对码才能建 WebSocket，本机网页负责把配对码显示出来给人看。
+    if (local) snap.pairingCode = PAIR_PIN
+    sendJson(res, 200, { ...snap, local })
     return
   }
   if (urlPath === '/api/peers' && method === 'GET') {
@@ -561,7 +582,39 @@ const server = http.createServer((req, res) => {
   })
 })
 
-const wss = new WebSocketServer({ server, path: WS_PATH })
+/**
+ * WS 握手鉴权：本机连接（回环 / 本机网卡 IP）自动放行；
+ * 局域网设备必须在 URL 上带正确的配对码 ?pin=xxxxxx，否则握手阶段直接拒绝。
+ * 放在 verifyClient 而非 connection 里，未授权连接根本不会建立、不会收到任何音频。
+ */
+const wss = new WebSocketServer({
+  server,
+  path: WS_PATH,
+  verifyClient: (info, done) => {
+    let queryPin = ''
+    try {
+      const u = new URL(info.req.url || '', 'http://localhost')
+      queryPin = u.searchParams.get('pin') || ''
+    } catch {
+      /* ignore */
+    }
+    const ok = allowHandshake({
+      remoteIp: info.req.socket && info.req.socket.remoteAddress,
+      localAddresses: localAddresses(),
+      pin: PAIR_PIN,
+      queryPin,
+    })
+    if (ok) {
+      // 只有非本机且带了码才算「配对」，本机连接不算
+      if (queryPin) {
+        console.log(`  ${c.green}[auth] 配对成功：${queryPin}${c.reset}`)
+      }
+      return done(true)
+    }
+    console.log(`  ${c.yellow}[auth] 拒绝未授权连接：配对码错误或缺失${c.reset}`)
+    done(false, 403, 'pairing code required')
+  },
+})
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true

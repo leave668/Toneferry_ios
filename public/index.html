@@ -859,6 +859,31 @@
       .tf-row > * {
         flex: 1;
       }
+      /* ---- 配对码 ---- */
+      .pairing-code {
+        font-size: 30px;
+        font-weight: 700;
+        letter-spacing: 0.22em;
+        color: var(--color-accent);
+        font-variant-numeric: tabular-nums;
+        user-select: all;
+      }
+      .pairing-input {
+        width: 100%;
+        padding: 12px 14px;
+        border-radius: var(--radius-md);
+        border: 1px solid var(--glass-border);
+        background: var(--glass);
+        color: var(--color-card-foreground);
+        font-size: 18px;
+        letter-spacing: 0.18em;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+        outline: none;
+      }
+      .pairing-input:focus {
+        border-color: var(--color-accent);
+      }
       .tf-peers {
         list-style: none;
         margin: 0;
@@ -914,6 +939,29 @@
           <span id="statusText">未连接</span>
         </div>
       </header>
+
+      <!-- 配对码：本机显示供手机输入，手机显示输入框 -->
+      <section class="tf-card" id="pairingLocalCard" hidden>
+        <div class="tf-card-head">
+          <span class="tf-card-title">手机连接配对码</span>
+          <span class="tf-badge">仅本机可见</span>
+        </div>
+        <p class="tf-card-hint">在手机上打开本页后输入下面 6 位数字；局域网其他设备没有配对码无法接入。</p>
+        <div class="pairing-code" id="pairingCode">———</div>
+      </section>
+
+      <section class="tf-card" id="pairingPhoneCard" hidden>
+        <div class="tf-card-head">
+          <span class="tf-card-title">输入配对码</span>
+          <span class="tf-badge" id="pairingBadge">未验证</span>
+        </div>
+        <p class="tf-card-hint" id="pairingHint">向电脑端查看配对码，填入后才能连接收听。</p>
+        <div class="tf-row">
+          <input id="pairingInput" class="pairing-input" type="text" inputmode="numeric"
+                 autocomplete="one-time-code" maxlength="8" placeholder="6 位配对码" />
+          <button id="btnPairing" class="primary-button" type="button">保存</button>
+        </div>
+      </section>
 
       <section class="player-card" id="playerCard">
         <div class="player-body">

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""把交叉编译产物打成 TrollStore 可安装的未签名 IPA。
+"""把交叉编译产物打成 TrollStore 可安装的未签名 IPA（不加签名壳）。
 
 用法: python tools/pack.py
-产物: release/Toneferry-ios.ipa
+产物: 工作区根目录 release/Toneferry-ios.ipa（与 exe 分开，各自只放正式产物）
 """
 import os
 import shutil
@@ -14,7 +14,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "out"
 BUILD = ROOT / "build"
-RELEASE = ROOT.parent / "release"
+RELEASE = ROOT.parent.parent / "release"  # 工作区根目录 release/
 APP_NAME = "Toneferry"
 BUNDLE = f"{APP_NAME}.app"
 

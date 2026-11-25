@@ -21,7 +21,6 @@ echo "[1/2] 编译 arm64 Mach-O（deployment target 15.0）…"
   -fuse-ld=lld \
   -fobjc-arc -fblocks -O2 \
   -Wall -Wno-unused-parameter \
-  -Wl,-adhoc_codesign \
   -framework Foundation -framework UIKit -framework AVFoundation -framework AVFAudio \
   -framework AVKit -framework MediaPlayer -framework CoreMedia -framework CoreVideo \
   -framework CoreText -framework CoreGraphics -framework QuartzCore \

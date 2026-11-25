@@ -126,13 +126,8 @@ async function stampBaseNodeIconAsync(iconPath) {
 
 async function main() {
   const captureExe = path.join(ROOT, 'bin', 'audio-capture.exe')
-  const playerExe = path.join(ROOT, 'bin', 'audio-play.exe')
   mustExist(captureExe, 'Run: npm run build:capture')
-  // audio-play.exe 是可选的历史遗留文件：麦克风功能已移除，
-  // 缺了也不影响打包与收听主链路。
-  if (!fs.existsSync(playerExe)) {
-    console.warn('[warn] audio-play.exe 不存在（麦克风已移除，可忽略）')
-  }
+  // audio-play.exe 与麦克风一并移除，不再打进包里（省约 1.6MB）
   mustExist(path.join(ROOT, 'public', 'index.html'), 'Missing public/index.html')
   const iconIco = path.join(ROOT, 'public', 'icon.ico')
   mustExist(iconIco, 'Missing public/icon.ico — generate app icon first')
@@ -150,9 +145,6 @@ async function main() {
   // 给采集器补版本资源：没有 ProductName/FileDescription 的未签名 exe
   // 是杀软启发式拦截的典型特征。补一个版本信息能显著降低误报率。
   stampVersionOnCapture(path.join(BUILD_DIR, 'bin', 'audio-capture.exe'), iconIco)
-  if (fs.existsSync(playerExe)) {
-    fs.copyFileSync(playerExe, path.join(BUILD_DIR, 'bin', 'audio-play.exe'))
-  }
 
   console.log('[2/7] bundling server…')
   await esbuild.build({
@@ -203,7 +195,7 @@ async function main() {
       '--output',
       stagedPkg,
       '--compress',
-      'GZip',
+      'Brotli',
     ],
     {
       stdio: 'inherit',

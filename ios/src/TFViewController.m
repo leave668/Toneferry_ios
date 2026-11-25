@@ -13,6 +13,7 @@
     UILabel *_titleLabel;
     UILabel *_subLabel;
     UITextField *_hostField;
+    UITextField *_pinField;
     UIButton *_startButton;
     UIButton *_stopButton;
     UILabel *_statusLabel;
@@ -77,6 +78,27 @@ static NSString *const kLatencyKey = @"tf.latency";
     NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"tf.host"];
     _hostField.text = saved.length ? saved : @"";
     [self.view addSubview:_hostField];
+
+    _pinField = [[UITextField alloc] init];
+    _pinField.backgroundColor = [UIColor colorWithRed:0.106 green:0.106 blue:0.188 alpha:1.0];
+    _pinField.textColor = [UIColor whiteColor];
+    _pinField.tintColor = [UIColor colorWithRed:0.13 green:0.77 blue:0.37 alpha:1.0];
+    _pinField.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    _pinField.layer.cornerRadius = 12;
+    _pinField.layer.borderWidth = 1;
+    _pinField.layer.borderColor = [UIColor colorWithRed:0.19 green:0.18 blue:0.5 alpha:0.8].CGColor;
+    _pinField.keyboardType = UIKeyboardTypeNumberPad;
+    _pinField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _pinField.autocorrectionType = UITextAutocorrectionTypeNo;
+    _pinField.returnKeyType = UIReturnKeyDone;
+    _pinField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    _pinField.placeholder = @"配对码（电脑端网页/托盘查看）";
+    _pinField.delegate = self;
+    _pinField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 14, 1)];
+    _pinField.leftViewMode = UITextFieldViewModeAlways;
+    NSString *savedPin = [[NSUserDefaults standardUserDefaults] stringForKey:@"tf.pin"];
+    _pinField.text = savedPin.length ? savedPin : @"";
+    [self.view addSubview:_pinField];
 
     _startButton = [self buttonWithTitle:@"开始收听"
                                   color:[UIColor colorWithRed:0.13 green:0.77 blue:0.37 alpha:1.0]
@@ -261,6 +283,8 @@ static NSString *const kLatencyKey = @"tf.latency";
     y += 34;
     _hostField.frame = CGRectMake(pad, y, contentW, 52);
     y += 64;
+    _pinField.frame = CGRectMake(pad, y, contentW, 48);
+    y += 60;
     _startButton.frame = CGRectMake(pad, y, contentW, 52);
     y += 60;
     _stopButton.frame = CGRectMake(pad, y, (contentW - 12) / 2, 44);
@@ -309,11 +333,19 @@ static NSString *const kLatencyKey = @"tf.latency";
         _statusLabel.text = @"请先填写电脑地址";
         return;
     }
+    NSString *pin = [_pinField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (pin.length == 0) {
+        _statusLabel.text = @"请填写配对码（电脑端网页/托盘查看）";
+        return;
+    }
     [[NSUserDefaults standardUserDefaults] setObject:host forKey:@"tf.host"];
+    [[NSUserDefaults standardUserDefaults] setObject:pin forKey:@"tf.pin"];
     [self rememberHost:host];
     _player.host = host;
+    _player.pin = pin;
     _player.targetLatencyMs = kLatencyOptions[[self savedLatencyIndex]];
     [_hostField resignFirstResponder];
+    [_pinField resignFirstResponder];
 
     _startButton.enabled = NO;
     _startButton.alpha = 0.45;

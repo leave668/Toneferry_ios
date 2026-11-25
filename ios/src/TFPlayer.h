@@ -36,6 +36,8 @@ typedef NS_ENUM(NSInteger, TFPlayerState) {
 @property (nonatomic, readonly) TFPlayerState state;
 /// "192.168.0.80:3088"
 @property (nonatomic, copy) NSString *host;
+/// 配对码：电脑端网页/托盘显示的 4~8 位数字，拼到 WS URL 供握手鉴权
+@property (nonatomic, copy) NSString *pin;
 
 /// 端到端延迟目标（毫秒）。越小越跟手，但更容易被网络抖动打断。
 /// 默认 120。范围会被夹到 60~600。

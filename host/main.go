@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -91,6 +92,8 @@ const (
 	idDefenderExclusion
 	idDiagnose
 	idQuit
+	idCopyPin
+	idResetPin
 )
 
 const idPeerBase = 2000
@@ -114,10 +117,11 @@ type serverStatus struct {
 	// 总闸开着但电脑静音时，托盘不能写「推流中」让人以为在放声音，
 	// 必须区分「有声 / 静音」两种状态。
 	AudioActive  bool       `json:"audioActive"`
-	AudioFrames  int64      `json:"audioFrames"`
-	NativeCount  int        `json:"nativeCount"`
-	Clients      int        `json:"clients"`
-	Peers        []peerInfo `json:"peers"`
+	AudioFrames   int64      `json:"audioFrames"`
+	NativeCount   int        `json:"nativeCount"`
+	Clients       int        `json:"clients"`
+	Peers         []peerInfo `json:"peers"`
+	PairingCode   string     `json:"pairingCode"`
 }
 
 type notifyIconData struct {
@@ -585,12 +589,64 @@ func killServerImage(path string) {
 	time.Sleep(150 * time.Millisecond)
 }
 
+// pinPath 返回配对码文件路径。配对码持久化在数据目录，重启后保持不变，
+// 用户不必每次开电脑都重新念一遍配对码给手机。
+func pinPath(dir string) string {
+	return filepath.Join(dir, "pairing-code.txt")
+}
+
+// loadOrCreatePin 读取已保存的配对码；不存在或格式非法时生成 6 位数字并写回。
+func loadOrCreatePin(dir string) string {
+	p := pinPath(dir)
+	if raw, err := os.ReadFile(p); err == nil {
+		s := strings.TrimSpace(string(raw))
+		if validPin(s) {
+			return s
+		}
+	}
+	pin := newPin()
+	_ = os.WriteFile(p, []byte(pin), 0o600)
+	return pin
+}
+
+func validPin(s string) bool {
+	if len(s) < 4 || len(s) > 8 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// newPin 用 crypto/rand 生成 6 位数字，避免可预测的配对码。
+func newPin() string {
+	var buf [6]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "123456" // 极端降级：仍可用，但概率极低
+	}
+	for i := range buf {
+		buf[i] = '0' + buf[i]%10
+	}
+	return string(buf[:])
+}
+
+// resetPin 生成新配对码并覆盖保存，返回新码。
+func resetPin(dir string) string {
+	pin := newPin()
+	_ = os.WriteFile(pinPath(dir), []byte(pin), 0o600)
+	return pin
+}
+
 func startServer() error {
 	dir, _ := dataDir()
 	logPath := filepath.Join(dir, "toneferry.log")
 	if st, err := os.Stat(logPath); err == nil && st.Size() > 4*1024*1024 {
 		os.Remove(logPath)
 	}
+	pin := loadOrCreatePin(dir)
 
 	cmd := exec.Command(serverExe)
 	cmd.Dir = filepath.Dir(serverExe)
@@ -598,6 +654,7 @@ func startServer() error {
 	cmd.Env = append(os.Environ(),
 		"TONEFERRY_NO_BROWSER=1",
 		"TONEFERRY_LOG_FILE="+logPath,
+		"TONEFERRY_PIN="+pin,
 		fmt.Sprintf("PORT=%d", port),
 	)
 	cmd.Stdin = nil
@@ -848,6 +905,11 @@ func showMenu(hwnd uintptr) {
 	} else {
 		appendItem(mfString|mfGrayed, 0, "服务启动中…")
 	}
+	// 配对码：手机/局域网设备接入凭据，点菜单项即可复制到剪贴板。
+	if st != nil && st.PairingCode != "" {
+		appendItem(mfString|mfGrayed, 0, "配对码  "+st.PairingCode+"  （手机连接需用）")
+		appendItem(mfString, idCopyPin, "复制配对码")
+	}
 	appendItem(mfSeparator, 0, "")
 
 	if st != nil {
@@ -901,6 +963,7 @@ func showMenu(hwnd uintptr) {
 	appendItem(mfSeparator, 0, "")
 	appendItem(mfString, idDefenderExclusion, "安全软件放行（Defender 白名单）")
 	appendItem(mfString, idDiagnose, "生成诊断报告")
+	appendItem(mfString, idResetPin, "重置配对码（重启服务）")
 	appendItem(mfSeparator, 0, "")
 	appendItem(mfString, idQuit, "退出")
 
@@ -940,6 +1003,13 @@ func handleMenu(id uint32, st *serverStatus) {
 		addDefenderExclusion()
 	case id == idDiagnose:
 		runDiagnose()
+	case id == idCopyPin:
+		if st != nil && st.PairingCode != "" {
+			copyText(st.PairingCode)
+			balloon("配对码已复制", st.PairingCode+" 已复制到剪贴板，粘贴到手机端输入框。", niifInfo)
+		}
+	case id == idResetPin:
+		resetPairingCode()
 	case id == idOpenPage:
 		openPage()
 	case id == idOpenLog:
@@ -1049,6 +1119,25 @@ func copyText(text string) {
 		}
 	}
 	user32.NewProc("CloseClipboard").Call()
+}
+
+// resetPairingCode 生成新配对码并重启服务端，让新码生效。
+// 旧码立即失效 —— 已连接的设备不受影响，但断线重连后必须用新码。
+func resetPairingCode() {
+	dir, _ := dataDir()
+	pin := resetPin(dir)
+	// 先停旧服务（shutdown 会走服务端正常退出流程），再拉起新的加载新码。
+	postControl("shutdown")
+	if childCmd != nil && childCmd.Process != nil {
+		time.Sleep(250 * time.Millisecond)
+		_ = childCmd.Process.Kill()
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := startServer(); err != nil {
+		balloon("重置配对码失败", err.Error(), niifWarn)
+		return
+	}
+	balloon("配对码已重置", "新配对码："+pin+"\n请在电脑网页或本菜单查看，并更新手机端输入。", niifInfo)
 }
 
 func quitApp() {

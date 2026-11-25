@@ -291,6 +291,7 @@ static OSStatus pipeRender(TFAudioPipe *p,
     _ioBufferMs = 5.0;
     _state = TFPlayerStateIdle;
     _host = @"";
+    _pin = @"";
     _targetLatencyMs = 120;
     _pipe = pipeCreate();
 
@@ -1007,7 +1008,14 @@ static OSStatus pipeRender(TFAudioPipe *p,
         host = [host componentsSeparatedByString:@"/"].firstObject;
     }
     if ([host rangeOfString:@":"].location == NSNotFound) host = [host stringByAppendingString:@":3088"];
-    return [NSURL URLWithString:[NSString stringWithFormat:@"ws://%@/audio", host]];
+    NSString *pin = [_pin stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (pin.length == 0) {
+        return [NSURL URLWithString:[NSString stringWithFormat:@"ws://%@/audio", host]];
+    }
+    // 配对码拼到 query，服务端在 WS 握手阶段校验；本机连接无需配对。
+    NSString *encoded = [pin stringByAddingPercentEncodingWithAllowedCharacters:
+                         [NSCharacterSet alphanumericCharacterSet]];
+    return [NSURL URLWithString:[NSString stringWithFormat:@"ws://%@/audio?pin=%@", host, encoded ?: pin]];
 }
 
 - (void)connect {

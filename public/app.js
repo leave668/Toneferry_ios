@@ -18,13 +18,32 @@ const channelsEl = document.getElementById('channels')
 const bufferedEl = document.getElementById('buffered')
 const levelEl = document.getElementById('level')
 
-/* 关闭网页 / 最近连接 */
-/** 本页是否跑在电脑上（只有本机页面显示「关闭网页」） */
+/* 关闭网页 / 配对码 / 最近连接 */
+/** 本页是否跑在电脑上（只有本机页面显示「关闭网页」和配对码） */
 let isLocalPage = false
 const btnClosePage = document.getElementById('btnClosePage')
 const closePageHint = document.getElementById('closePageHint')
 const peersList = document.getElementById('peersList')
 const peersBadge = document.getElementById('peersBadge')
+
+/* ---- 配对码 ---- */
+const PIN_KEY = 'toneferry.pin'
+const pairingLocalCard = document.getElementById('pairingLocalCard')
+const pairingPhoneCard = document.getElementById('pairingPhoneCard')
+const pairingCodeEl = document.getElementById('pairingCode')
+const pairingInput = document.getElementById('pairingInput')
+const btnPairing = document.getElementById('btnPairing')
+const pairingBadge = document.getElementById('pairingBadge')
+const pairingHint = document.getElementById('pairingHint')
+/** 手机端已保存的配对码（本机页面不需要） */
+let savedPin = ''
+/** 本次 WS 握手是否被服务端拒绝（配对码错误），用于停止无效重连 */
+let pairingRejected = false
+try {
+  savedPin = String(localStorage.getItem(PIN_KEY) || '').trim()
+} catch {
+  /* 隐私模式下 localStorage 可能不可用 */
+}
 
 /** true = 保持屏幕常亮（会阻止锁屏）。锁屏播放场景应为 false。 */
 const KEEP_SCREEN_ON = false
@@ -116,7 +135,16 @@ function playingLabel() {
 
 function wsUrl() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}/audio`
+  let url = `${proto}//${location.host}/audio`
+  // 本机连接服务端自动放行；局域网设备必须带正确配对码才能握手成功。
+  const pin = isLocalPage ? '' : savedPin
+  if (pin) url += `?pin=${encodeURIComponent(pin)}`
+  return url
+}
+
+/** 手机端未填配对码就不发连接，避免无限重连刷屏。 */
+function pairingReady() {
+  return isLocalPage || /^\d{4,8}$/.test(savedPin)
 }
 
 function clearReconnect() {
@@ -565,6 +593,14 @@ function scheduleReconnect() {
 function connectWs() {
   clearReconnect()
 
+  // 手机端没配对码时不要建立连接（服务端会握手拒绝），给出明确提示即可。
+  if (!pairingReady()) {
+    setStatus('请先输入配对码')
+    pairingHint.textContent = '请先输入配对码，保存后才能连接收听。'
+    return
+  }
+  pairingRejected = false
+
   if (ws) {
     ws.onclose = null
     ws.onerror = null
@@ -634,6 +670,18 @@ function connectWs() {
 
   ws.onclose = () => {
     ws = null
+    // 握手被拒（配对码错误）：停止重连，让用户改配对码后再点开始。
+    if (pairingRejected) {
+      pairingRejected = false
+      listening = false
+      btnStart.disabled = false
+      btnStop.disabled = true
+      pairingBadge.textContent = '配对码错误'
+      pairingBadge.classList.remove('on')
+      pairingHint.textContent = '配对码不正确，请向电脑端确认后重新输入。'
+      setStatus('配对失败：配对码错误')
+      return
+    }
     if (listening || nativePeerCount > 0) {
       scheduleReconnect()
     } else {
@@ -644,6 +692,8 @@ function connectWs() {
   }
 
   ws.onerror = () => {
+    // 浏览器不会把 403 的具体原因暴露给 JS；非本机连接失败一律先怀疑配对码。
+    if (!isLocalPage) pairingRejected = true
     if (!listening) setStatus('WebSocket 错误')
   }
 }
@@ -1055,11 +1105,59 @@ async function refreshLocalFlag() {
   try {
     const r = await fetch('/api/status', { cache: 'no-store' })
     const j = await r.json()
+    const wasLocal = isLocalPage
     isLocalPage = !!j.local
     // 「关闭网页」只对电脑本机页面有意义：手机页面关掉就没法收听了。
     if (btnClosePage) btnClosePage.hidden = !isLocalPage
+
+    // 配对码只在 status 里对本机返回；本机显示大字供手机输入，手机显示输入框。
+    if (pairingLocalCard) pairingLocalCard.hidden = !isLocalPage
+    if (pairingPhoneCard) pairingPhoneCard.hidden = isLocalPage
+    if (isLocalPage) {
+      if (pairingCodeEl && j.pairingCode) pairingCodeEl.textContent = j.pairingCode
+    } else if (pairingInput && document.activeElement !== pairingInput) {
+      pairingInput.value = savedPin
+    }
+
+    // 本机/手机身份发生变化时，按新角色重建连接。
+    if (wasLocal !== isLocalPage && listening) connectWs()
   } catch {
     // 保持上一次的判断：网络抖一下不该让按钮闪没
+  }
+}
+
+function savePairing() {
+  const val = String(pairingInput?.value || '').trim()
+  if (!/^\d{4,8}$/.test(val)) {
+    pairingBadge.textContent = '格式错误'
+    pairingBadge.classList.remove('on')
+    pairingHint.textContent = '请输入 4~8 位数字配对码。'
+    return
+  }
+  savedPin = val
+  try {
+    localStorage.setItem(PIN_KEY, savedPin)
+  } catch {
+    /* ignore */
+  }
+  pairingBadge.textContent = '已保存'
+  pairingBadge.classList.add('on')
+  pairingHint.textContent = '配对码已保存，正在连接…'
+  // 配对码变了，用新凭据重连；若之前因未配对被拦，这里就能接上。
+  if (listening || nativePeerCount > 0) connectWs()
+}
+
+btnPairing?.addEventListener('click', savePairing)
+pairingInput?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') savePairing()
+})
+
+// 手机端：已保存过配对码就回填并标记，省得每次重输
+if (!isLocalPage && savedPin) {
+  if (pairingInput) pairingInput.value = savedPin
+  if (pairingBadge) {
+    pairingBadge.textContent = '已保存'
+    pairingBadge.classList.add('on')
   }
 }
 
