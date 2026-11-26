@@ -15,7 +15,7 @@ import { normalizePin, allowHandshake } from './pairing.js'
  * 服务端版本。pkg 打包成单文件后读不到 package.json，这里必须硬编码。
  * 升级时同步改 package.json / package-lock.json / ios/Info.plist 与本行。
  */
-const VERSION = '1.7.5'
+const VERSION = '1.7.6'
 
 /**
  * 配对码：局域网设备接入的凭据。

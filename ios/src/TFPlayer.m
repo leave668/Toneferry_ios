@@ -1035,7 +1035,11 @@ static OSStatus pipeRender(TFAudioPipe *p,
     _task = task;
     [task resume];
     [self receiveLoopForTask:task];
+    // 手机端自己开闸：服务端总闸默认关闭，只有收到 start-stream 才下发音频。
+    // 旧版只发 get-config，必须依赖电脑网页点「开始收听」；一旦网页没开或被关掉，
+    // 手机就永远停在「等待电脑端声音」。这里和网页端对齐，连上即开闸。
     [self sendJSON:@{@"type": @"get-config"}];
+    [self sendJSON:@{@"type": @"start-stream"}];
 }
 
 - (void)closeTask {
