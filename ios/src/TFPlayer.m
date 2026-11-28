@@ -228,6 +228,10 @@ static OSStatus pipeRender(TFAudioPipe *p,
     BOOL _graphReady;
     BOOL _wantPlaying;
     BOOL _connecting;
+    /// 本次连接是否已发出开闸请求（get-config + start-stream）。
+    /// resume 后 task.state 切到 Running 是异步的，立即 sendJSON 可能被丢；
+    /// 收到服务端首条消息时据此补发，确保首次连接和断线重连都能可靠开闸。
+    BOOL _streamRequested;
     /// 电脑网页端的总闸状态（false 时服务端不下发音频）
     BOOL _streamEnabled;
     /// 是否收到过非静音帧。没收到过时界面要说「等电脑出声」，
@@ -1030,14 +1034,29 @@ static OSStatus pipeRender(TFAudioPipe *p,
     }
 
     _connecting = YES;
+    _streamRequested = NO;
     [self setState:TFPlayerStateConnecting detail:@"连接中…"];
     NSURLSessionWebSocketTask *task = [_session webSocketTaskWithURL:url];
     _task = task;
     [task resume];
     [self receiveLoopForTask:task];
     // 手机端自己开闸：服务端总闸默认关闭，只有收到 start-stream 才下发音频。
-    // 旧版只发 get-config，必须依赖电脑网页点「开始收听」；一旦网页没开或被关掉，
-    // 手机就永远停在「等待电脑端声音」。这里和网页端对齐，连上即开闸。
+    // 注意 [task resume] 后 state 切到 Running 是异步的，这里立即发可能被静默丢弃
+    // （断线重连时旧 task 刚 cancel，时序更慢，更容易中招）。
+    // 因此请求开闸走 requestStream，且收到服务端首条消息时会补发保底。
+    [self requestStream];
+}
+
+/// 请求服务端开闸：幂等，首次连接和断线重连都调用。
+/// 立即尝试一次；若此刻 task 还没到 Running 被 sendJSON 丢掉，
+/// 收到服务端首条消息（receiveLoop 里）会再补一次，确保请求一定送达。
+- (void)requestStream {
+    if (_streamRequested || !_wantPlaying) return;
+    NSURLSessionWebSocketTask *task = _task;
+    // 失败态在 NSURLSessionTaskState 里归入 Completed，没有 Failed 这个枚举值。
+    if (!task || task.state == NSURLSessionTaskStateCanceling ||
+        task.state == NSURLSessionTaskStateCompleted) return;
+    _streamRequested = YES;
     [self sendJSON:@{@"type": @"get-config"}];
     [self sendJSON:@{@"type": @"start-stream"}];
 }
@@ -1063,6 +1082,10 @@ static OSStatus pipeRender(TFAudioPipe *p,
             return;
         }
         s->_connecting = NO;
+        // 收到服务端消息 = WebSocket 握手已完成、双向通道可用。
+        // 若在 connect 里立即发的 start-stream 被异步窗口丢掉了，这里是可靠补发点：
+        // 服务端一连上就主动推 audio-config / stream-state，所以这条几乎必然触发。
+        [s requestStream];
         if (message.type == NSURLSessionWebSocketMessageTypeData) {
             NSData *data = message.data;
             dispatch_async(s->_workQueue, ^{ [s handlePCM:data]; });
@@ -1152,7 +1175,12 @@ static OSStatus pipeRender(TFAudioPipe *p,
 
 - (void)sendJSON:(NSDictionary *)obj {
     NSURLSessionWebSocketTask *task = _task;
-    if (!task || task.state != NSURLSessionTaskStateRunning) return;
+    // 不能只认 Running：[task resume] 后到 state 变成 Running 之间有一段异步窗口，
+    // 旧逻辑在这个窗口里直接 return，把 start-stream 丢了 —— 断线重连后手机永远等不到闸。
+    // NSURLSessionWebSocketTask 在 Suspended（已 resume）状态调用 sendMessage 是安全的，
+    // 系统会把消息排队，等握手完成再真正发出。只挡已经终止/取消/失败的 task。
+    if (!task || task.state == NSURLSessionTaskStateCanceling ||
+        task.state == NSURLSessionTaskStateCompleted) return;
     NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
     if (!data) return;
     NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
